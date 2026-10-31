@@ -1,0 +1,4 @@
+# Overrides for the Bitnami WordPress Helm chart.
+# Full list of options: helm show values oci://registry-1.docker.io/bitnamicharts/wordpress
+
+wordpressBlogName: "RussetLeaf K8s WordPress"

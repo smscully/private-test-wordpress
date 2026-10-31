@@ -5,13 +5,18 @@ metadata:
   namespace: argocd
 spec:
   project: default
-  source:
-    repoURL: https://github.com/smscully/private-test-wordpress.git
-    targetRevision: main
-    path: .
-    directory:
-      # Keep Argo CD from also applying this Application file
-      exclude: application.yaml
+  sources:
+    # WordPress Helm chart (Bitnami, OCI registry)
+    - repoURL: registry-1.docker.io/bitnamicharts
+      chart: wordpress
+      targetRevision: 34.2.5
+      helm:
+        valueFiles:
+          - $values/helm/wordpress/values.yaml
+    # This repo, referenced as $values for the chart's values file
+    - repoURL: https://github.com/smscully/private-test-wordpress.git
+      targetRevision: main
+      ref: values
   destination:
     server: https://kubernetes.default.svc
     namespace: wordpress-test
