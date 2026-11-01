@@ -102,18 +102,20 @@ Record each answer in the [decision log](#decision-log).
 
 ### Step 1.6: Database and cache
 **Do:**
-- **RDS for MariaDB**, the same major version as the home lab (e.g. 11.4), Multi-AZ, private subnets, security group allowing only the EKS nodes/pods, parameter group with `require_secure_transport = ON`, automated backups (7 days), encryption, `deletion_protection = false` (demo), `skip_final_snapshot = false` with a timestamped final snapshot name.
+- **RDS for MariaDB**, the same major version as the home lab (e.g. 11.4), Multi-AZ, private subnets, **`manage_master_user_password = true`** (RDS generates, stores and rotates the master password in Secrets Manager), security group allowing only the EKS nodes/pods, parameter group with `require_secure_transport = ON`, automated backups (7 days), encryption, `deletion_protection = false` (demo), `skip_final_snapshot = false` with a timestamped final snapshot name.
+- **RDS Proxy** in front of it (engine family `MYSQL`, which covers MariaDB): `require_tls = true`; an auth entry for the `wordpress` user with **`iam_auth = REQUIRED`**, backed by a Secrets Manager secret holding a Terraform-generated password; a proxy IAM role that can read only that secret; security groups allowing EKS pods → proxy → RDS only. Optionally turn on Secrets Manager rotation for the `wordpress` secret.
+- **Spike early:** from a test pod with the WordPress image, confirm PHP's MariaDB client (mysqlnd) can log in to the proxy with an IAM token over TLS (`database.auth: iam`). If it can't, this is where you find out, before Phase 3.
 - **Restore logic:** look up the most recent `russetleaf-com-final-*` snapshot; if one exists, restore from it, otherwise create an empty database.
 - **ElastiCache Valkey** replication group (primary + replica, Multi-AZ), TLS in transit, AUTH token in Secrets Manager.
 - Snapshot housekeeping: keep the last 3 final snapshots (a small Lambda or a scheduled GitHub Action deletes older ones).
 
-**Test:** from a test pod, connect to RDS over TLS (and fail without TLS) and to Valkey with TLS and the token; destroy creates a final snapshot; the next apply restores from it (create a test table to prove it).
+**Test:** from a test pod, generate a token (`aws rds generate-db-auth-token --hostname <proxy-endpoint> --port 3306 --username wordpress`) and log in to the **proxy** over TLS with it (the MariaDB client needs its cleartext plugin enabled to send the token); confirm a plain password and a non-TLS connection are refused; confirm the master password exists only in Secrets Manager; connect to Valkey with TLS and the token; destroy creates a final snapshot; the next apply restores from it (create a test table to prove it).
 
 ### Step 1.7: russetleaf.com app resources and permissions
 **Do:**
 - Using the shared modules: summary SQS queue + dead-letter queue, Secrets Manager entries for russetleaf.com, Bedrock access (gateway role + budget alert).
 - **WAF web ACL** for the ALB (AWS managed rule groups: core rule set, known bad inputs, WordPress, IP reputation; rate limiting on `/wp-login.php`).
-- **Pod Identity associations** (one IAM role per service account, least privilege): WordPress (media bucket, send to queue, SES send), summarizer (read from queue), LiteLLM (Bedrock invoke on chosen models), External Secrets (russetleaf.com secrets), KEDA (queue attributes), ExternalDNS (the russetleaf.com zone), Load Balancer Controller, llama.cpp init container (model mirror bucket, read only), seed Job (read russetleaf.dev backup and media buckets, write russetleaf.com media bucket), Falcosidekick/OpenCost if they need AWS APIs.
+- **Pod Identity associations** (one IAM role per service account, least privilege): WordPress (media bucket, send to queue, SES send, **`rds-db:connect` on the proxy's `wordpress` user**), summarizer (read from queue), LiteLLM (Bedrock invoke on chosen models), External Secrets (russetleaf.com secrets), KEDA (queue attributes), ExternalDNS (the russetleaf.com zone), Load Balancer Controller, llama.cpp init container (model mirror bucket, read only), seed Job (read russetleaf.dev backup and media buckets, write russetleaf.com media bucket, `rds-db:connect` through the proxy), `db-setup` Job (read the RDS-managed master secret and the `wordpress` secret), Falcosidekick/OpenCost if they need AWS APIs.
 - SES SMTP credentials (or an IAM role for an SES API plugin) in Secrets Manager, and the **Slack bot token** entry for russetleaf.com (same bot, separate entry so the sites stay independent).
 - **`alerting` module:** SNS topics; CloudWatch alarms for the ALB (5xx rate, target response time), RDS (CPU, free storage, connections, replica lag) and ElastiCache (memory, evictions), created and destroyed with the demo stack; Amazon Q Developer channel configurations for `#rl-com-alerts`, `#rl-critical` and `#rl-costs` (the Slack workspace is authorised once in the AWS console, then managed in Terraform).
 
@@ -175,15 +177,16 @@ Record each answer in the [decision log](#decision-log).
 **Do:** `apps/wordpress/overlays/aws`:
 - `WP_HOME`/`WP_SITEURL` = `https://russetleaf.com`; the HTTPS-behind-proxy setting.
 - 3 replicas, HPA (3–10), PDB, **topology spread** across AZs.
-- RDS and Valkey endpoints (TLS), russetleaf.com media bucket with the **CloudFront domain** as the media URL in the offload plugin, SQS queue URL, SES for email.
+- **`database.auth: iam`** with the **RDS Proxy endpoint**, region and the RDS CA bundle (no database password Secret at all); Valkey endpoint (TLS);
+- `apps/db-setup/`: an idempotent **PreSync Job** that reads the master and `wordpress` secrets and runs `CREATE USER IF NOT EXISTS` / `GRANT` for the `wordpress` user (real work only on the first demo; the user survives in the final snapshot); russetleaf.com media bucket with the **CloudFront domain** as the media URL in the offload plugin, SQS queue URL, SES for email.
 - Ingress for the ALB: `origin.russetleaf.com`, the ACM certificate, the WAF ACL, a listener rule requiring the `X-Origin-Verify` header (requests without it get 403), and a security group allowing only the CloudFront origin-facing prefix list.
 - The Rollout using the CloudWatch analysis template.
 
-**Test:** after sync, russetleaf.com switches from the offline page to the live site on its own; requesting the ALB directly (without CloudFront) returns 403; media loads from CloudFront; a test SQL-injection request is blocked by WAF; the password-reset email arrives (SES sandbox: send to a verified address, or request production access).
+**Test:** after sync, russetleaf.com switches from the offline page to the live site on its own; the WordPress pods have **no database password** in their environment or Secrets; a forced Multi-AZ failover (`aws rds reboot-db-instance --force-failover`) causes only a few seconds of errors; requesting the ALB directly (without CloudFront) returns 403; media loads from CloudFront; a test SQL-injection request is blocked by WAF; the password-reset email arrives (SES sandbox: send to a verified address, or request production access).
 
 ### Step 3.2: Content
 **Do:**
-- `apps/seed-from-dev/`: the one-off seed Job (manual sync): download the latest russetleaf.dev backup, import into RDS, `wp search-replace 'russetleaf.dev' 'russetleaf.com' --all-tables`, `aws s3 sync` the media.
+- `apps/seed-from-dev/`: the one-off seed Job (manual sync): download the latest russetleaf.dev backup, import into RDS **through RDS Proxy with an IAM token**, `wp search-replace 'russetleaf.dev' 'russetleaf.com' --all-tables`, `aws s3 sync` the media.
 - Run it once for the first demo.
 
 **Test:** russetleaf.com shows the same posts and images as russetleaf.dev; destroy and re-create the demo stack, and the content is still there (restored from the final snapshot).
@@ -210,7 +213,7 @@ Record each answer in the [decision log](#decision-log).
 ## Phase 5: Security and cost review
 
 ### Step 5.1: Security review
-**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS and Valkey aren't reachable from outside the VPC; no pod has an AWS key (Pod Identity everywhere); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
+**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
 
 **Test:** a written checklist in `docs/` with each item checked.
 
