@@ -496,6 +496,47 @@ The summarizer reports **OpenTelemetry metrics** to Prometheus, labelled by mode
 
 Prometheus also collects the gateway's metrics (requests, spend and fallbacks per model) and **llama.cpp's built-in metrics** (tokens per second, requests waiting). A **Grafana dashboard** shows these alongside the WordPress metrics, the LLM node's CPU and memory, and the LLM node's cost from OpenCost. **Alertmanager** alerts on error spikes, messages in the dead-letter queue, the self-hosted model being down, and daily Bedrock spend over a set limit, posting them to `#rl-mlops` (and `#rl-critical` for criticals). The Argo Rollouts canary analysis uses the same metrics.
 
+## WordPress monitoring
+
+Prometheus **scrapes** (pulls) metrics from HTTP endpoints; nothing pushes to it. As in most production setups, WordPress is monitored mainly through **exporters around it** (ingress, web server, database, cache, synthetic probes), plus one small **custom metrics plugin** for the few things only WordPress knows. No third-party "WordPress Prometheus" plugin is used: the ones available tend to be small, sparsely maintained, and export generic counts that aren't useful for alerting.
+
+### What's monitored, and how
+
+| Layer | What it tells you | russetleaf.dev (home) | russetleaf.com (AWS) |
+|---|---|---|---|
+| Requests (rate, errors, latency) | Is the site healthy for visitors? | ingress-nginx metrics | ALB metrics from CloudWatch |
+| Web server / PHP | Busy vs idle Apache workers, saturation | **apache_exporter** sidecar reading Apache's `mod_status` page (localhost only) | Same |
+| Database | Connections, slow queries, errors | **MariaDB Operator's built-in metrics** (mysqld-exporter sidecar) | RDS and RDS Proxy metrics from CloudWatch |
+| Object cache | Hit ratio, memory, evictions | **redis_exporter** (works with Valkey) | ElastiCache metrics from CloudWatch |
+| Synthetic checks inside the cluster | Do key pages and the REST API respond correctly? | **blackbox_exporter** probing `/`, `/wp-login.php` and `/wp-json/` | Same |
+| WordPress itself | Application health | **Custom metrics plugin** (below) | Same |
+| Request traces (optional) | Which code or query is slow | OpenTelemetry PHP → Grafana Tempo (optional; costs memory) | Same, during demos |
+
+(If the image is ever switched from Apache to PHP-FPM + nginx, use **php-fpm_exporter** instead of apache_exporter.)
+
+### The custom metrics plugin
+A must-use plugin in `wp-image` (`mu-plugins/metrics/`) exposes a handful of metrics specific to this project:
+
+| Metric | Meaning | Used for |
+|---|---|---|
+| `wordpress_posts_without_summary` | Published posts still missing an AI summary | The best end-to-end check that the summarizer pipeline works; alert if above zero for an hour |
+| `wordpress_cron_overdue_events` | WP-Cron events past their due time | Shows whether the WP-Cron CronJob is running; alert if it keeps growing |
+| `wordpress_object_cache_hit_ratio` | From the Redis Object Cache plugin's stats | Warns when caching stops working (database load rises) |
+| `wordpress_info{version, php_version, image_version}` | What's actually running | Checking rollouts; spotting version drift between sites |
+| `wordpress_posts_published`, `wordpress_comments_pending`, `wordpress_users` | Counts | Dashboards only |
+
+How it's built safely:
+- **Never on the public site.** Metrics are served on a **separate internal port** (a second Apache listener, e.g. 9117), not under the public site's URLs. The ingress never routes to that port, and a **CiliumNetworkPolicy** allows only Prometheus to reach it.
+- **Cheap to scrape.** Values are cached for about a minute (in Valkey or a WordPress transient), so a scrape doesn't run database queries each time.
+- **Shipped with the chart:** the WordPress chart includes the apache_exporter sidecar, a `ServiceMonitor` for both the exporter and the metrics port, and `PrometheusRule` alerts with runbooks (`WordPressPostsMissingSummaries`, `WordPressCronBacklog`, `WordPressObjectCacheHitRatioLow`, `WordPressApacheWorkersSaturated`, `WordPressSyntheticProbeFailing`).
+- **Tested:** a unit test for the output format, and a ci test that scrapes the endpoint in the kind cluster.
+
+### Optional: request tracing
+OpenTelemetry's PHP auto-instrumentation (a PHP extension plus SDK, added to the image) can send traces of each request (PHP functions, database queries, outgoing calls) to **Grafana Tempo**, linked from Grafana dashboards. It's the most detailed view of slow requests, but Tempo costs memory box 1 doesn't have to spare, so it's **optional**: turn it on for investigations, or during AWS demos where memory isn't tight.
+
+### Cost and memory
+$0. The exporters are small (roughly 20–50 MB each); the custom plugin adds nothing measurable. Only the optional Tempo tracing is expensive.
+
 ## Alerting and notifications (Slack)
 
 Every alert and operational event from both sites goes to **Slack**, routed by **site** and **topic**, so problems reach a person instead of sitting in a dashboard.
@@ -918,6 +959,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Terraform for both sides, in one repo (`wp-infra`):** shared modules, plus separate root modules for russetleaf.com's always-on edge, its demo stack (including Karpenter and its NodePools), and the russetleaf.dev home lab (Talos provider `siderolabs/talos` for both nodes' machine configs, Cloudflare provider for the tunnel, DNS and WAF rules, and the AWS pieces used from home).
 - **CI on GitHub in every repo:** Terraform checks and plans in `wp-infra`; manifest validation and Kyverno policy tests in `wp-gitops`; image builds with SBOMs, scans and signing in `wp-image` and `llm-summarizer`; and the prompt evaluation gate in `llm-summarizer`. Employers see all of it without the AWS stack running.
 - **Environments and promotion:** local, ci (kind + LocalStack + mock LLM per pull request), on-demand scale-to-zero staging with scrubbed production data, and automated promotion to production after staging passes.
+- **Application-level monitoring:** exporters around WordPress (Apache, database, cache, synthetic probes) plus a custom metrics plugin with a business-level signal (`posts_without_summary`) tied to an alert and a runbook.
 - **Operational alerting:** alerts as code with tests and runbooks, routed to Slack by site and severity, with inhibition rules, a dead man's switch, external uptime checks and silences during demo teardown.
 - **Documentation:** architecture diagrams for both environments, the cost breakdown, Grafana dashboard screenshots, Slack alert screenshots, runbooks, sample evaluation reports comparing models, and demo recordings.
 
@@ -984,6 +1026,7 @@ wp-gitops/
     monitoring/             # prometheus-operator-crds (first sync wave), kube-prometheus-stack (watching
                             #   ServiceMonitors in all namespaces), Grafana dashboards, alert rules (+ promtool tests),
                             #   Alertmanager routing to Slack (receivers per site in the overlays)
+                            #   blackbox_exporter probes for key WordPress URLs
     external-secrets/       # External Secrets Operator + AWS Secrets Manager store
     ingress/                # home: ingress-nginx; aws: AWS Load Balancer Controller
     external-dns/           # ExternalDNS, manages origin.russetleaf.com in Route 53 (aws only)
@@ -993,8 +1036,9 @@ wp-gitops/
                             #   default-deny CiliumClusterwideNetworkPolicy, Cilium/Hubble ServiceMonitors,
                             #   dashboards and alert rules
     nvidia-device-plugin/   # exposes GPUs to pods (aws only)
-    mariadb/                # MariaDB Operator + database + scheduled Backup to S3 (home only; RDS on AWS)
-    valkey/                 # Valkey object cache (home only; ElastiCache on AWS)
+    mariadb/                # MariaDB Operator + database + scheduled Backup to S3 + metrics sidecar
+                            #   (home only; RDS on AWS)
+    valkey/                 # Valkey object cache + redis_exporter (home only; ElastiCache on AWS)
     keda/                   # KEDA operator (event-driven autoscaling)
     argo-rollouts/          # Argo Rollouts controller (canary releases)
     kyverno/                # Kyverno + policies (signed images and digests, allowed registries, no :latest,
@@ -1075,8 +1119,11 @@ wp-image/
   chart/                    # the WordPress Helm chart: Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob,
                             #   CiliumNetworkPolicy (per-site destinations set in values), probes, non-root +
                             #   read-only root filesystem with emptyDir volumes for writable paths
+                            #   + apache_exporter sidecar, ServiceMonitor and PrometheusRule alerts
   mu-plugins/
     summary-queue/          # sends post IDs to SQS when a post is published or updated
+    metrics/                # custom Prometheus metrics on an internal port (posts without summary, cron
+                            #   backlog, cache hit ratio, versions)
   tests/                    # smoke test: the container starts, plugins are active, health check passes
   ci/                       # kind config, ci chart values (LocalStack, test credentials), integration tests
   compose.yaml              # local environment: WordPress + MariaDB + Valkey + LocalStack
