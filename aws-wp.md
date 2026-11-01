@@ -141,11 +141,27 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 
 ### Supply chain and policy
 - CI builds each image, generates an **SBOM** (a list of every package in the image) with **Syft**, scans it with **Trivy**, and **signs** it with **cosign** (keyless, using GitHub's OIDC identity).
-- **Kyverno** policies in the cluster:
-  - accept only images signed by the release workflows of `wp-image` and `llm-summarizer`, pulled from the project's registry
-  - reject `:latest` tags
-  - require CPU and memory requests and limits
-  - block privileged pods outside the namespaces that need them
+- **Kyverno** policies in the cluster (each named after its equivalent in the official Kyverno policy library):
+
+| Policy | Kyverno equivalent | What it enforces here |
+|---|---|---|
+| Signed images | Image verification (`verifyImages`, cosign keyless) | Only images signed by the `wp-image` and `llm-summarizer` release workflows run as the project's own workloads; tags are replaced with **digests** at admission (`mutateDigest`), so a re-pushed tag can't change what runs |
+| Allowed registries | **Restrict Image Registries** (`restrict-image-registries`) | Every container (including init and ephemeral containers) comes from `ghcr.io/<you>/*` or an explicit list of upstream registries used by the platform charts (Cilium, Falco, Argo CD, MariaDB, ...); on EKS, also AWS's own add-on registries |
+| No `latest` tag | **Disallow Latest Tag** (`disallow-latest-tag`) | Every image has an explicit tag or digest |
+| Required labels | **Require Labels** (`require-labels`), plus a **mutate** rule | Workloads carry `app.kubernetes.io/name`, `app.kubernetes.io/part-of` and `env`; the mutate rule fills in `env` from the namespace, so the validate rule is only a backstop. These labels drive alert routing, OpenCost and policy selectors |
+| Requests and limits | **Require Requests and Limits** (`require-requests-limits`) | CPU and memory **requests** and a **memory limit** on every container. **CPU limits are deliberately not required**: they cause throttling (slowing WordPress and llama.cpp) without protecting anything; memory limits are what protect box 1 |
+| No privileged containers | **Disallow Privileged Containers** (`disallow-privileged-containers`), within Kyverno's **Pod Security Standards** `baseline` rule set | No privileged containers, host paths or host namespaces (network, PID, IPC). Talos already enforces Pod Security `baseline`; Kyverno adds reporting, CI tests and narrow exceptions |
+| Run as non-root | **Require Run As Non-Root** (`require-run-as-nonroot`), from the Pod Security `restricted` set | Containers run as a non-root user. The WordPress image runs Apache as `www-data` on port 8080 (non-root processes can't use port 80) |
+| Read-only root filesystem | **Require Read-Only Root Filesystem** (`require-ro-rootfs`) | Containers can't write to their own filesystem. WordPress gets small writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions and the uploads directory (the offload plugin writes files there briefly before moving them to S3). Backs up the Falco rule on writes to `/var/www/html` |
+| Health probes | **Require Pod Probes** (`require-pod-probes`) | Readiness and liveness probes on every long-running workload; Argo Rollouts, the HPA and Kubernetes' own restarts depend on them |
+| No NodePorts | **Disallow NodePort** (`restrict-nodeport`), plus a rule blocking `LoadBalancer` Services | Nothing needs them: traffic arrives through the Cloudflare Tunnel at home and through the ALB (created from an Ingress, target type `ip`) on AWS |
+| Unique Ingress hosts | **Unique Ingress Host and Path** (`unique-ingress-host-and-path`), which looks up existing Ingresses before admitting a new one | Two Ingresses can't claim the same host and path (e.g. a staging or admin hostname colliding with production) |
+| Default-deny networking | A **generate** rule | Every new application namespace gets the Cilium baseline allowances (see [Networking](#networking-cilium-and-hubble)) |
+
+**Where each policy applies strictly:** the project's own workloads (WordPress, the summarizer, the LiteLLM gateway, the staging and seed Jobs) must pass **all** of them. Third-party platform components get narrow **`PolicyException`** resources only where they genuinely need it, for example: Cilium, Falco, local-path-provisioner, the NVIDIA device plugin and (on EKS) the VPC CNI and EBS CSI node agents need privileged access; some upstream images can't run with a read-only filesystem or as non-root. Each exception names the exact namespace and workload and is reviewed like any other change.
+
+**Rollout:** every policy starts in **audit mode**; Policy Reporter's findings go to `#rl-security`; fix or add a justified exception for each; then switch to **enforce**.
+
 - The **Kyverno CLI** (`kyverno test` and `kyverno apply`) runs the same policies in `wp-gitops` CI against every manifest change, so violations fail the pull request before Argo CD ever deploys them. This covers the "policy checks before deploy" role often given to OPA, without a second policy engine.
 - **Checkov** (in `wp-infra` CI) checks the Terraform for insecure settings before anything is applied.
 
@@ -605,7 +621,7 @@ email:
 serviceAccount:
   create: true                     # AWS access (S3, SQS, SES) via EKS Pod Identity; no annotation needed
 
-resources:                         # required by the Kyverno policies
+resources:                         # requests + memory limit required by Kyverno (no CPU limit, by design)
   requests:
     cpu: 250m
     memory: 256Mi
@@ -748,7 +764,7 @@ Box 2 has about **6.5–7 GB** free for the model. A **3B model** (4-bit) is the
 Box 1 is the tight one: Talos, Cilium and Hubble, Argo CD, monitoring, WordPress and the platform services (Kyverno, KEDA, Falco, OpenCost, LiteLLM and others) come to roughly 6–7 GB of its 8 GB. (Hubble UI can be scaled to zero when not in use.) To keep headroom:
 - Let the **ARC runners** tolerate box 2's taint, so evaluation jobs run next to the model (they mostly wait on it anyway).
 - Keep **Prometheus retention** short (e.g. 7 days) and scrape every 30–60 seconds rather than 15.
-- Set requests and limits on everything (Kyverno already requires them), so a busy pod can't starve the others.
+- Set requests and memory limits on everything (Kyverno already requires them), so a busy pod can't starve the others.
 
 The cluster still has a single control plane, so it isn't highly available. That's acceptable for a home lab; the AWS design covers high availability.
 
@@ -953,9 +969,11 @@ wp-gitops/
     valkey/                 # Valkey object cache (home only; ElastiCache on AWS)
     keda/                   # KEDA operator (event-driven autoscaling)
     argo-rollouts/          # Argo Rollouts controller (canary releases)
-    kyverno/                # Kyverno + policies (signed images, no :latest, resource limits,
-                            #   no privileged pods) + a generate rule adding default-deny Cilium policies to new
-                            #   app namespaces + policy tests + Policy Reporter (violations to Slack)
+    kyverno/                # Kyverno + policies (signed images and digests, allowed registries, no :latest,
+                            #   required labels, requests/memory limits, Pod Security baseline, non-root,
+                            #   read-only root filesystem, probes, no NodePort/LoadBalancer Services, unique
+                            #   Ingress hosts) + PolicyExceptions + the default-deny Cilium generate rule
+                            #   + policy tests + Policy Reporter (violations to Slack)
     falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
@@ -1027,7 +1045,8 @@ wp-image/
   db.php                    # database drop-in: IAM auth token mode (database.auth: iam) or plain password
   plugins.json              # pinned plugin and theme versions (offload media, Redis object cache, SMTP, ...)
   chart/                    # the WordPress Helm chart: Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob,
-                            #   CiliumNetworkPolicy (per-site destinations set in values)
+                            #   CiliumNetworkPolicy (per-site destinations set in values), probes, non-root +
+                            #   read-only root filesystem with emptyDir volumes for writable paths
   mu-plugins/
     summary-queue/          # sends post IDs to SQS when a post is published or updated
   tests/                    # smoke test: the container starts, plugins are active, health check passes

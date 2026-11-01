@@ -265,7 +265,8 @@ Check `kubectl top nodes` after each step.
 
 ### Step 5.1: The WordPress image (`wp-image`)
 **Do:**
-- `Dockerfile` based on the official `wordpress` image (pinned version), with plugins and themes pinned in `plugins.json` and installed at build time: S3 media offload (e.g. WP Offload Media Lite), Redis Object Cache, an SMTP plugin (configured for Amazon SES).
+- `Dockerfile` based on the official `wordpress` image (pinned version), with plugins and themes pinned in `plugins.json` and installed at build time: S3 media offload (e.g. WP Offload Media Lite), Redis Object Cache, an SMTP plugin (configured for Amazon SES). WordPress code is copied into `/var/www/html` **at build time**, so the image's startup script has nothing to copy at runtime.
+- **Built to pass the Kyverno policies from step 6.1:** Apache runs as **`www-data`** listening on **port 8080** (non-root can't use port 80), and the container works with a **read-only root filesystem** given writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions and the uploads directory. Test both in the Compose smoke test.
 - `wp-config` settings read from environment variables (database, Valkey, S3, queue URL, `WP_HOME`/`WP_SITEURL`, `DISALLOW_FILE_MODS`, `DISABLE_WP_CRON`), with **TLS to the database** turned on.
 - A **`db.php` drop-in** whose behaviour is chosen by the chart setting **`database.auth`**. Build only the **`password`** mode now (reads the password from a Secret, connects over TLS); it's what the home lab uses, and it's the AWS fallback too. Leave a clear extension point for an **`iam`** mode, which is written **only after** the AWS plan's early test (step 1.6) shows that PHP can log in to RDS Proxy with an IAM token. That way no work is wasted if the test fails. Add the **RDS CA certificate bundle** to the image now (harmless at home, needed on AWS).
 - The **summary-queue must-use plugin**: on publish or update, send `{"post_id": ...}` to SQS (AWS SDK for PHP, installed with Composer at build time).
@@ -277,7 +278,7 @@ Check `kubectl top nodes` after each step.
 
 ### Step 5.2: WordPress chart and deployment (`wp-gitops/apps/wordpress/`)
 **Do:**
-- The `wp-image` chart, deployed from `wp-gitops` with the home overlay (values only): russetleaf.dev hostname, MariaDB and Valkey hosts, `database.auth: password` pointing at the **MariaDB Operator-generated Secret**, media bucket and queue settings, other credentials from External Secrets, resources, `persistence` off, WP-Cron as a Kubernetes CronJob.
+- The `wp-image` chart, which sets the pod security context (non-root user, read-only root filesystem, no privilege escalation, dropped capabilities), the `emptyDir` volumes above, **readiness and liveness probes**, the required labels (`app.kubernetes.io/name`, `app.kubernetes.io/part-of`, `env`) and **CPU/memory requests with a memory limit (no CPU limit)**, deployed from `wp-gitops` with the home overlay (values only): russetleaf.dev hostname, MariaDB and Valkey hosts, `database.auth: password` pointing at the **MariaDB Operator-generated Secret**, media bucket and queue settings, other credentials from External Secrets, resources, `persistence` off, WP-Cron as a Kubernetes CronJob.
 - Remove the old test Application and the `wordpress-test` namespace.
 - First-run setup (admin user, plugin settings) done by a one-off `wp-cli` Job or wp-config constants, so a rebuild needs no clicking.
 
@@ -325,18 +326,26 @@ Check `kubectl top nodes` after each step.
 ## Phase 6: Policy and progressive delivery
 
 ### Step 6.1: Kyverno
-**Do:** `platform/kyverno/`: Kyverno plus policies, in **audit mode** first:
-- only images signed by the `wp-image` and `llm-summarizer` release workflows (cosign keyless, GitHub OIDC issuer, subject matching each repo's workflow), pulled from GHCR (exclude third-party platform images, or add their publishers' signatures where available)
-- no `:latest` tags
-- CPU and memory requests and limits required
-- no privileged pods outside namespaces that need them (storage, Falco)
-- Policy tests with `kyverno test`, run in `wp-gitops` CI.
+**Do:** `platform/kyverno/`: Kyverno plus the policy set from `aws-wp.md` ([Supply chain and policy](aws-wp.md#supply-chain-and-policy)), all in **audit mode** first:
+- **Signed images** (`verifyImages`): images signed by the `wp-image` and `llm-summarizer` release workflows (cosign keyless, GitHub OIDC issuer, subject matching each repo's workflow), with **`mutateDigest`** so tags are pinned to digests at admission
+- **Restrict Image Registries:** `ghcr.io/<you>/*` plus an explicit list of the upstream registries the platform charts use (include init and ephemeral containers)
+- **Disallow Latest Tag**
+- **Require Labels** (`app.kubernetes.io/name`, `app.kubernetes.io/part-of`, `env`), plus a **mutate** rule that adds `env` from the namespace
+- **Require Requests and Limits:** CPU and memory requests and a memory limit; **no CPU limit required**
+- **Pod Security Standards `baseline`** (includes Disallow Privileged Containers, host paths and host namespaces)
+- **Require Run As Non-Root**
+- **Require Read-Only Root Filesystem**
+- **Require Pod Probes** (readiness and liveness on long-running workloads)
+- **Disallow NodePort**, plus blocking `LoadBalancer` Services
+- **Unique Ingress Host and Path**
+- **`PolicyException`s**, each naming the exact namespace and workload, only where needed: Cilium, Falco, local-path-provisioner (privileged/host access); upstream images that can't run read-only or as non-root (e.g. some operators or llama.cpp's image, if so). The project's own workloads get **no** exceptions.
+- Policy tests with `kyverno test` (a passing and a failing example per policy), run in `wp-gitops` CI.
 
 - **Policy Reporter** (Kyverno's reporting add-on) sending new policy violations to `#rl-security`.
 
 Review the policy reports, fix violations, then switch to **enforce**.
 
-**Test:** in enforce mode, an unsigned image and a `:latest` image are both rejected; the existing workloads keep running; a pull request that violates a policy fails CI.
+**Test:** in enforce mode, each of these is rejected: an unsigned image, an image from an unlisted registry, a `:latest` image, a pod without the required labels (where the mutate rule can't fill them), a container without a memory limit, a privileged pod, a root container, a writable root filesystem, a Deployment without probes, a NodePort Service, and an Ingress reusing an existing host and path. Running pods show image digests rather than tags. The existing workloads keep running; Policy Reporter shows no unexplained violations; a pull request that violates a policy fails CI.
 
 ### Step 6.2: Argo Rollouts
 **Do:** `platform/argo-rollouts/`; convert WordPress to a `Rollout` with canary steps (e.g. 20% → 50% → 100%) and an `AnalysisTemplate` that queries Prometheus (ingress-nginx error rate and latency for the WordPress service). Argo Rollouts notifications post canary steps, aborts and rollbacks to `#rl-deploys`.

@@ -162,14 +162,14 @@ Record each answer in the [decision log](#decision-log).
 - Monitoring: same stack; add CloudWatch metrics (ALB, RDS, ElastiCache) per the step 0.2 decision. Grafana is reached by `kubectl port-forward` only (there's no Cloudflare Access on this site). Alertmanager overlay: external labels `site=com`, `cluster=eks`; receivers for `#rl-com-alerts` and `#rl-critical`, plus the shared `#rl-security`, `#rl-mlops` and `#rl-costs` routes; the `Watchdog` heartbeat goes to its **own** heartbeat check, which is paused when the demo stack is down.
 - **CiliumNetworkPolicies:** the same cluster-wide baseline and per-component policies from each component's `base/` (home lab step 6.3), with AWS-specific destinations in `overlays/aws`: WordPress → the **RDS Proxy** and **ElastiCache** endpoints **by DNS name** instead of in-cluster MariaDB and Valkey; inbound to WordPress from the ALB (target-type `ip`, so traffic arrives from the VPC; allow the VPC's CIDR or the ALB's subnets); no cloudflared policy.
 - **Cilium and Hubble metrics:** the same `platform/cilium/` monitoring values as home (ServiceMonitors, Hubble metric set, dashboards, alert rules), now that the Prometheus Operator exists; Hubble UI by `kubectl port-forward`.
-- Kyverno: same policies; allow any AWS-provided system images (add exclusions for `kube-system` images published by AWS).
+- Kyverno: the same policy set as home; add AWS's add-on registries (the EKS add-on ECR registries and `public.ecr.aws`) to the **Restrict Image Registries** allow-list, and narrow **`PolicyException`s** for AWS-managed `kube-system` components that need privileged or host access or don't meet the label, probe, non-root or read-only rules (the VPC CNI's `aws-node`, `kube-proxy`, the EBS CSI node agent, the Pod Identity agent), plus Cilium, Falco and the NVIDIA device plugin. The project's own workloads get no exceptions.
 - KEDA: Pod Identity for the SQS scaler.
 - Argo Rollouts: an `AnalysisTemplate` variant using **CloudWatch** (ALB 5xx rate and target response time) instead of ingress-nginx metrics.
 - Falco: modern eBPF on AL2023, same custom rules; Falcosidekick to `#rl-security`.
 - Kyverno's Policy Reporter and Argo Rollouts notifications: same Slack setup as home, prefixed `[com]`.
 - Trivy Operator, OpenCost (with AWS on-demand/spot pricing).
 
-**Test:** each component is healthy; a Kyverno test (unsigned image) is still rejected; OpenCost shows EC2 costs for the nodes.
+**Test:** each component is healthy; the home lab's Kyverno rejection tests (unsigned image, unlisted registry, `:latest`, missing labels or memory limit, privileged, root, writable root filesystem, no probes, NodePort/LoadBalancer Service, duplicate Ingress host) all still fail on EKS; OpenCost shows EC2 costs for the nodes.
 
 ### Step 2.5: kube-bench
 **Do:** `platform/kube-bench/`: a Job using the **EKS CIS benchmark** profile, with results saved to `docs/` in `wp-gitops` (e.g. `docs/kube-bench-eks-<date>.txt`) and a short summary of any failures and why they're accepted or fixed.
