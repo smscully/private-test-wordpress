@@ -36,9 +36,9 @@ These home lab steps must be done first, because this plan builds on them:
 **Do:**
 - **Request a GPU quota increase** for G-family instances (both on-demand and spot) in your region. New accounts usually start at 0 and approval can take days, so do this first.
 - **russetleaf.com DNS:** if the domain is registered outside Route 53, plan to move its name servers to Route 53 in step 1.2.
-- **Budget guardrails:** add a second AWS Budget for the demo (e.g. alert at $20 and $40 per month), and a **Cost Anomaly Detection** monitor with email alerts.
+- **Budget guardrails:** add a second AWS Budget for the demo (e.g. alert at $20 and $40 per month), and a **Cost Anomaly Detection** monitor. Send both to an **SNS topic** connected to Slack `#rl-costs` through **Amazon Q Developer in chat applications** (formerly AWS Chatbot), as well as by email. (Created by hand here; Terraform's `alerting` module takes over in step 1.7.)
 
-**Test:** the quota request is submitted; budget alerts arrive as test emails.
+**Test:** the quota request is submitted; a test budget notification arrives by email and in `#rl-costs`.
 
 ### Step 0.2: Decisions to make before writing code
 Record each answer in the [decision log](#decision-log).
@@ -71,7 +71,7 @@ Record each answer in the [decision log](#decision-log).
 - SES domain identity for russetleaf.com, with DKIM records in Route 53.
 - Outputs for `envs/aws` (zone ID, certificate ARNs, secret ARN, bucket names).
 
-**Test:** `curl -I https://russetleaf.com` returns **503** with the offline page; the page links to russetleaf.dev; the SES identity shows "verified". Leave this stack running from now on (about $1/month).
+**Test:** `curl -I https://russetleaf.com` returns **503** with the offline page; the page links to russetleaf.dev; the SES identity shows "verified". Add the russetleaf.com **external uptime check** (expects 200 or the 503 offline page) and confirm it's green and posts to `#rl-com-alerts` and `#rl-critical` when it fails (test by pointing it at a wrong URL). Leave this stack running from now on (about $1/month).
 
 ### Step 1.3: Network (`envs/aws`)
 **Do:** VPC across three AZs: public and private subnets, Internet Gateway, the NAT Gateway(s) decided in step 0.2, an S3 gateway endpoint (free; keeps S3 traffic off the NAT), subnet tags for the Load Balancer Controller and Karpenter discovery.
@@ -107,14 +107,15 @@ Record each answer in the [decision log](#decision-log).
 - Using the shared modules: summary SQS queue + dead-letter queue, Secrets Manager entries for russetleaf.com, Bedrock access (gateway role + budget alert).
 - **WAF web ACL** for the ALB (AWS managed rule groups: core rule set, known bad inputs, WordPress, IP reputation; rate limiting on `/wp-login.php`).
 - **Pod Identity associations** (one IAM role per service account, least privilege): WordPress (media bucket, send to queue, SES send), summarizer (read from queue), LiteLLM (Bedrock invoke on chosen models), External Secrets (russetleaf.com secrets), KEDA (queue attributes), ExternalDNS (the russetleaf.com zone), Load Balancer Controller, llama.cpp init container (model mirror bucket, read only), seed Job (read russetleaf.dev backup and media buckets, write russetleaf.com media bucket), Falcosidekick/OpenCost if they need AWS APIs.
-- SES SMTP credentials (or an IAM role for an SES API plugin) in Secrets Manager.
+- SES SMTP credentials (or an IAM role for an SES API plugin) in Secrets Manager, and the **Slack bot token** entry for russetleaf.com (same bot, separate entry so the sites stay independent).
+- **`alerting` module:** SNS topics; CloudWatch alarms for the ALB (5xx rate, target response time), RDS (CPU, free storage, connections, replica lag) and ElastiCache (memory, evictions), created and destroyed with the demo stack; Amazon Q Developer channel configurations for `#rl-com-alerts`, `#rl-critical` and `#rl-costs` (the Slack workspace is authorised once in the AWS console, then managed in Terraform).
 
-**Test:** with `aws iam simulate-principal-policy`, each role allows exactly what it should and nothing else.
+**Test:** with `aws iam simulate-principal-policy`, each role allows exactly what it should and nothing else; forcing a CloudWatch alarm into ALARM state (`aws cloudwatch set-alarm-state`) posts to `#rl-com-alerts`.
 
 ### Step 1.8: Argo CD on EKS
-**Do:** Terraform installs Argo CD with Helm and applies the root Application pointing at `wp-gitops/bootstrap/aws`. Argo CD's UI is reached by `kubectl port-forward` only (no public endpoint for demos).
+**Do:** Terraform installs Argo CD with Helm and applies the root Application pointing at `wp-gitops/bootstrap/aws`. Argo CD's UI is reached by `kubectl port-forward` only (no public endpoint for demos). **Argo CD Notifications** post to `#rl-deploys`, prefixed `[com]`.
 
-**Test:** Argo CD lists the AWS root app (it will show missing components until Phase 2).
+**Test:** Argo CD lists the AWS root app (it will show missing components until Phase 2), and its first sync appears in `#rl-deploys`.
 
 ### Step 1.9: `wp-infra` CI for AWS
 **Do:** extend CI to plan `envs/aws-edge` and `envs/aws` on pull requests. Applies are done by the demo workflows (Phase 6) or locally, never automatically on merge, so merging never starts a paid stack.
@@ -145,12 +146,13 @@ Record each answer in the [decision log](#decision-log).
 ### Step 2.4: Shared platform services on AWS
 **Do:** add `overlays/aws` for each shared component, changing only what AWS needs:
 - External Secrets: Pod Identity instead of the bootstrap key.
-- Monitoring: same stack; add CloudWatch metrics (ALB, RDS, ElastiCache) per the step 0.2 decision. Grafana is reached by `kubectl port-forward` only (there's no Cloudflare Access on this site).
+- Monitoring: same stack; add CloudWatch metrics (ALB, RDS, ElastiCache) per the step 0.2 decision. Grafana is reached by `kubectl port-forward` only (there's no Cloudflare Access on this site). Alertmanager overlay: external labels `site=com`, `cluster=eks`; receivers for `#rl-com-alerts` and `#rl-critical`, plus the shared `#rl-security`, `#rl-mlops` and `#rl-costs` routes; the `Watchdog` heartbeat goes to its **own** heartbeat check, which is paused when the demo stack is down.
 - NetworkPolicies: the same policies from each component's `base/`, with AWS-specific allowances (e.g. WordPress → RDS and ElastiCache endpoints instead of in-cluster MariaDB and Valkey).
 - Kyverno: same policies; allow any AWS-provided system images (add exclusions for `kube-system` images published by AWS).
 - KEDA: Pod Identity for the SQS scaler.
 - Argo Rollouts: an `AnalysisTemplate` variant using **CloudWatch** (ALB 5xx rate and target response time) instead of ingress-nginx metrics.
-- Falco: modern eBPF on AL2023, same custom rules.
+- Falco: modern eBPF on AL2023, same custom rules; Falcosidekick to `#rl-security`.
+- Kyverno's Policy Reporter and Argo Rollouts notifications: same Slack setup as home, prefixed `[com]`.
 - Trivy Operator, OpenCost (with AWS on-demand/spot pricing).
 
 **Test:** each component is healthy; a Kyverno test (unsigned image) is still rejected; OpenCost shows EC2 costs for the nodes.
@@ -214,11 +216,11 @@ Record each answer in the [decision log](#decision-log).
 
 ### Step 6.1: Demo workflows
 **Do:** GitHub Actions in `wp-infra`, started by hand (`workflow_dispatch`):
-- **`demo-up`:** `terraform apply` in `envs/aws`; wait for Argo CD to sync; wait until russetleaf.com returns 200; post the start time (e.g. as a tag on the VPC).
-- **`demo-down`:** suspend Argo CD auto-sync; delete the Applications in reverse order; wait until the ALB, the `origin` record and the Karpenter nodes are gone (with timeouts); `terraform destroy` in `envs/aws`; confirm russetleaf.com returns the 503 offline page and no tagged demo resources remain.
-- **Safety net:** a scheduled workflow (hourly) that alerts (and optionally runs `demo-down`) if the demo stack has been up longer than a set limit (e.g. 6 hours).
+- **`demo-up`:** `terraform apply` in `envs/aws`; wait for Argo CD to sync; wait until russetleaf.com returns 200; resume the russetleaf.com heartbeat check; post the start time (e.g. as a tag on the VPC) and "russetleaf.com demo started" to `#rl-com-alerts`.
+- **`demo-down`:** create an Alertmanager **silence** for `site=com` and pause the russetleaf.com heartbeat check; suspend Argo CD auto-sync; delete the Applications in reverse order; wait until the ALB, the `origin` record and the Karpenter nodes are gone (with timeouts); `terraform destroy` in `envs/aws`; confirm russetleaf.com returns the 503 offline page and no tagged demo resources remain; post "russetleaf.com demo stopped" (with the run time) to `#rl-com-alerts`.
+- **Safety net:** a scheduled workflow (hourly) that alerts `#rl-costs` and `#rl-critical` (and optionally runs `demo-down`) if the demo stack has been up longer than a set limit (e.g. 6 hours).
 
-**Test:** run `demo-up` and `demo-down` end to end twice without manual steps; force the safety net by lowering the limit.
+**Test:** run `demo-up` and `demo-down` end to end twice without manual steps, and confirm the teardown produces **no** alert noise in Slack (only the "stopped" message); force the safety net by lowering the limit.
 
 ### Step 6.2: Full rehearsal and demo script
 **Do:** write `docs/demo-script.md`: what to show and in what order (offline page → `demo-up` → live site → publish a post and watch the summary → Grafana LLM dashboard → Argo Rollouts canary → Kyverno rejecting an unsigned image → Falco alert → OpenCost → `demo-down` → offline page). Rehearse, then record a walkthrough.
@@ -238,7 +240,8 @@ Record each answer in the [decision log](#decision-log).
 | Keep the EKS version in standard support | Before each demo, if a new version is out | Bump the version in `envs/aws`; the stack is rebuilt each demo, so there's no in-place upgrade |
 | Clean up old final snapshots | Automatic (step 1.6) | Check that only the last 3 remain |
 | Check the always-on edge for drift | Weekly | Scheduled `terraform plan` for `envs/aws-edge` in `wp-infra` CI |
-| Check for leftovers | After each demo | Search for resources tagged `Stack=demo`; the Budget and Cost Anomaly alerts are the backstop |
+| Check for leftovers | After each demo | Search for resources tagged `Stack=demo`; the Budget and Cost Anomaly alerts in `#rl-costs` are the backstop |
+| Review russetleaf.com alert noise | After each demo | Anything that fired during the demo should have been real; tune or remove alerts that weren't |
 | Rotate the CloudFront-to-ALB secret header | Every few months | Change the value in `envs/aws-edge`; the next demo picks it up |
 | Review costs | After each demo | Cost Explorer filtered by `Site=com`, compared with the demo hours recorded |
 

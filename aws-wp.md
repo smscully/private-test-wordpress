@@ -32,7 +32,8 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Bedrock | Same models through the gateway, with its own budget alert | Same models through the gateway, with its own budget alert |
 | Terraform environment (`wp-infra`) | `envs/aws-edge` (always on) + `envs/aws` (demo stack) | `envs/home` |
 | GitOps overlay (`wp-gitops`) | `overlays/aws` | `overlays/home` |
-| Monthly cost | ~$1 always on, plus ~$1/hour during demos | ~$7–$14 |
+| Alerts (Slack) | `#rl-com-alerts` (+ `#rl-critical` for criticals) | `#rl-dev-alerts` (+ `#rl-critical` for criticals) |
+| Monthly cost | ~$1 always on, plus ~$1/hour during demos | ~$8–$15 |
 
 Running MariaDB and Valkey inside the home cluster, instead of RDS and ElastiCache, is the biggest saving in the home lab: those two managed services alone would cost about $130/month at the AWS design's sizes. Both sites use the **MariaDB** engine (in-cluster at home, RDS for MariaDB on AWS), so database backups move between them without conversion.
 
@@ -145,7 +146,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
   - a **shell started** in a WordPress, summarizer or gateway pod, which normally never happens
   - **files written under `/var/www/html`**, since WordPress code is built into the image and `DISALLOW_FILE_MODS` is set
   - **unexpected outbound connections** from the LLM nodes, which should only download model files
-- **Falcosidekick** sends Falco alerts to Alertmanager and Grafana. (On AWS, GuardDuty EKS Runtime Monitoring is the managed alternative; Falco runs the same on both clusters.)
+- **Falcosidekick** sends Falco alerts to Alertmanager, Grafana and Slack (`#rl-security`). (On AWS, GuardDuty EKS Runtime Monitoring is the managed alternative; Falco runs the same on both clusters.)
 - **kube-bench** audits the cluster against the **CIS Kubernetes Benchmark**, run as a Job with the EKS profile. Reports are saved to `docs/` in `wp-gitops`.
 - **Trivy Operator** runs continuously in the cluster, producing CIS compliance reports, vulnerability reports for running images, and configuration audits.
 
@@ -170,7 +171,8 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
   - **spot interruption handling** through an SQS queue fed by EventBridge, so pods move before AWS reclaims a spot node
 - **Cost visibility** with **OpenCost** (or the free Kubecost EKS bundle, which reads AWS billing data): cost per namespace, workload and node, including the GPU node's share and cost per summary alongside the Bedrock spend.
 - **Progressive delivery** with **Argo Rollouts**: new WordPress and summarizer versions go out as canaries (e.g. 10% → 50% → 100%). An analysis step checks Prometheus metrics (error rate, latency) at each stage and **rolls back automatically** if they get worse. The metrics come from **CloudWatch** on AWS (ALB 5xx rate and response time, through Argo Rollouts' CloudWatch provider) and from **ingress-nginx's Prometheus metrics** at home.
-- **Metrics, logs and alerts**: Prometheus, Grafana and Alertmanager (or CloudWatch Container Insights), including the LLM metrics described below.
+- **Metrics, logs and alerts**: Prometheus, Grafana and Alertmanager (or CloudWatch Container Insights), including the LLM metrics described below, with every alert routed to **Slack** by site and topic; see [Alerting and notifications](#alerting-and-notifications-slack).
+- **Deployment notifications**: Argo CD and Argo Rollouts post syncs, failures, canary steps and rollbacks to `#rl-deploys`.
 - **AWS Budgets alerts**, including one on Bedrock spending, in case a bug calls the model in a loop.
 - **Tagging**: every AWS resource gets `Project`, `Site` and `ManagedBy` tags (plus `Stack=edge|demo` on russetleaf.com) through the AWS provider's `default_tags`, so leftovers can be found and costs split per site.
 
@@ -228,7 +230,60 @@ The summarizer reports **OpenTelemetry metrics** to Prometheus, labelled by mode
 - estimated **cost per summary** and per day
 - **queue depth** and age of the oldest message (from SQS)
 
-Prometheus also collects the gateway's metrics (requests, spend and fallbacks per model) and **llama.cpp's built-in metrics** (tokens per second, requests waiting). A **Grafana dashboard** shows these alongside the WordPress metrics, the LLM node's CPU and memory, and the LLM node's cost from OpenCost. **Alertmanager** alerts on error spikes, messages in the dead-letter queue, the self-hosted model being down, and daily Bedrock spend over a set limit. The Argo Rollouts canary analysis uses the same metrics.
+Prometheus also collects the gateway's metrics (requests, spend and fallbacks per model) and **llama.cpp's built-in metrics** (tokens per second, requests waiting). A **Grafana dashboard** shows these alongside the WordPress metrics, the LLM node's CPU and memory, and the LLM node's cost from OpenCost. **Alertmanager** alerts on error spikes, messages in the dead-letter queue, the self-hosted model being down, and daily Bedrock spend over a set limit, posting them to `#rl-mlops` (and `#rl-critical` for criticals). The Argo Rollouts canary analysis uses the same metrics.
+
+## Alerting and notifications (Slack)
+
+Every alert and operational event from both sites goes to **Slack**, routed by **site** and **topic**, so problems reach a person instead of sitting in a dashboard.
+
+### Slack workspace and channels
+One Slack workspace for the project. The free plan is enough: it keeps 90 days of message history and allows up to 10 apps, and this design uses about five (the custom bot below, GitHub, Amazon Q Developer, the uptime checker and the heartbeat service).
+
+| Channel | What goes there | Sources |
+|---|---|---|
+| `#rl-critical` | Critical alerts from **both** sites: site down, database down, backups failing, monitoring dead. The only channel with phone notifications on. | Alertmanager (both clusters), dead man's switch, external uptime checks |
+| `#rl-dev-alerts` | All russetleaf.dev warnings and criticals | Alertmanager (home), Cloudflare notifications, uptime checks |
+| `#rl-com-alerts` | All russetleaf.com warnings and criticals, plus demo started/stopped messages | Alertmanager (EKS), CloudWatch alarms (ALB, RDS, ElastiCache), uptime checks, demo workflows |
+| `#rl-deploys` | Syncs, failed syncs, unhealthy apps, canary progress and automatic rollbacks, merged version-bump pull requests | Argo CD Notifications, Argo Rollouts notifications, GitHub |
+| `#rl-security` | Falco alerts, Kyverno policy violations, critical vulnerabilities in running images | Falcosidekick, Policy Reporter (Kyverno's reporting add-on), Trivy Operator metrics → Alertmanager |
+| `#rl-mlops` | Evaluation gate results, summarizer releases, Bedrock spend, dead-letter queue, model server down | GitHub, Alertmanager |
+| `#rl-costs` | AWS Budgets, Cost Anomaly Detection, weekly OpenCost summary | Amazon Q Developer in chat applications (formerly AWS Chatbot), Alertmanager |
+
+Every message carries a **`site=dev` or `site=com` label** (or a `[dev]` / `[com]` prefix), so the shared channels still show which site it came from.
+
+### How alerts are routed
+- **Site labels:** each cluster's Prometheus adds `site` (`dev` or `com`) and `cluster` (`talos-home` or `eks`) to everything it sends, as external labels.
+- **Alertmanager routing:**
+  - `severity=critical` → `#rl-critical` **and** the site's channel
+  - `severity=warning` → the site's channel
+  - alerts labelled `team=security`, `team=mlops` or `team=cost` → `#rl-security`, `#rl-mlops` or `#rl-costs`
+  - grouped by alert name and site, with repeat intervals (e.g. 4 hours for warnings, 1 hour for criticals) so ongoing problems don't spam the channel
+- **Inhibition rules:** when a site is down, its downstream alerts (WordPress errors, summarizer failures, etc.) are suppressed, so the one alert that matters stands out.
+- **One Slack app for the clusters:** a custom Slack app (e.g. "russetleaf-bot") with a bot token, used by Alertmanager, Argo CD Notifications, Argo Rollouts, Falcosidekick and Policy Reporter. The token lives in **Secrets Manager** and reaches each cluster through External Secrets; it's never in Git.
+
+### Watching from outside the clusters
+A cluster can't report that it's completely down, so two outside checks back up Alertmanager:
+- **Dead man's switch:** Alertmanager's always-firing `Watchdog` alert pings a free heartbeat service (e.g. healthchecks.io) every few minutes. If the pings stop (cluster down, Alertmanager broken, home internet out), the heartbeat service posts to `#rl-critical`.
+- **External uptime checks** (e.g. UptimeRobot or Better Stack free plans), every few minutes:
+  - russetleaf.dev must return 200
+  - russetleaf.com must return **either** the live site (200) **or** the offline page (503 with its known text). Either is fine; anything else means the always-on edge is broken.
+
+### AWS and Cloudflare alerts
+- **AWS:** CloudWatch alarms (ALB 5xx, RDS CPU/storage/connections, ElastiCache memory), AWS Budgets and Cost Anomaly Detection publish to **SNS** topics, which **Amazon Q Developer in chat applications** forwards to Slack. All of it is defined in `wp-infra` Terraform (an `alerting` module).
+- **Cloudflare:** notifications for tunnel health and security events go to a Slack webhook (`#rl-dev-alerts`).
+
+### Demo noise control (russetleaf.com)
+- `demo-down` creates an Alertmanager **silence** for russetleaf.com before tearing anything down, then posts "russetleaf.com demo stopped" to `#rl-com-alerts`.
+- `demo-up` posts "russetleaf.com demo started" once the site returns 200. CloudWatch alarms are created with the demo stack and deleted with it.
+
+### Alerts as code
+- Alert rules are `PrometheusRule` resources in Git (in each component's `base/`, plus the summarizer's chart), tested in CI with **`promtool test rules`**.
+- Every alert has `severity`, `summary`, `description` and a **`runbook_url`** pointing to `docs/runbooks/<alert>.md` in `wp-gitops`: what it means, how to check, how to fix.
+- **Every alert must be actionable.** If nobody would act on it, it's a dashboard panel, not an alert. A monthly review removes or tunes noisy alerts.
+- Alertmanager's routing config lives in `platform/monitoring/` (with `overlays/home` and `overlays/aws` setting the site-specific receivers).
+
+### Cost
+**$0.** Slack's free plan, the heartbeat service and the uptime checker's free plans, Amazon Q Developer in chat applications, and SNS at this volume are all free.
 
 ## Example Helm values (outline)
 
@@ -336,6 +391,7 @@ These are approximate prices for **us-east-1**, on demand unless noted, for a sm
 | Amazon Bedrock | ~10–20 new or edited posts/month plus CI evaluation runs, on Haiku and Nova (~$1 per 1M input tokens, ~$5 per 1M output for Haiku; Nova less) | ~$1–$2 |
 | LiteLLM, ARC runners, KEDA, Argo Rollouts, Kyverno, Falco, Trivy Operator, OpenCost, Karpenter, Prometheus/Grafana | run on the existing worker nodes | $0 |
 | kube-bench | Job run on demand | $0 |
+| Alerting (SNS, Amazon Q Developer in chat applications, Slack free plan) | CloudWatch alarms and budget alerts to Slack | $0 |
 | **Total** | | **~$700–$800 / month** |
 
 Without the self-hosted model (Bedrock only behind the gateway), the total is **~$490–$540 / month**. GuardDuty EKS Runtime Monitoring, if used instead of Falco, is billed per vCPU monitored and would add roughly $10–$20/month at this size. New AWS accounts usually have a **GPU instance quota of 0**, so request a quota increase for G-family instances (both on-demand and spot) before the first deploy.
@@ -505,6 +561,7 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Runtime security | Falco + Falcosidekick | Same (or GuardDuty EKS Runtime Monitoring) | $0 |
 | Compliance | Talos hardened defaults (documented) + Trivy Operator | kube-bench (EKS profile) + Trivy Operator | $0 |
 | Cost visibility | OpenCost | OpenCost or Kubecost EKS bundle | $0 |
+| Alerting | Alertmanager → Slack, dead man's switch, uptime checks, Cloudflare notifications | Same, plus CloudWatch alarms via SNS and Amazon Q Developer | $0 |
 | russetleaf.com always-on edge | n/a | Route 53 zone, CloudFront, offline page, media bucket, RDS snapshot (`envs/aws-edge`) | ~$1 |
 | **Total (24/7)** | | | **~$8–$15 / month** |
 
@@ -539,7 +596,8 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Pod permissions without stored keys at home (stretch goal):** publish the Talos cluster's service-account OIDC discovery files (e.g. in a public S3 bucket) and register them as an IAM OIDC provider. Pods such as WordPress (S3, SQS), the summarizer (SQS) and the gateway (Bedrock) then assume IAM roles without stored keys, just like IRSA on EKS. Until then, the home cluster uses narrowly scoped IAM user keys kept in Secrets Manager.
 - **Terraform for both sides, in one repo (`wp-infra`):** shared modules, plus separate root modules for russetleaf.com's always-on edge, its demo stack (including Karpenter and its NodePools), and the russetleaf.dev home lab (Talos provider `siderolabs/talos` for both nodes' machine configs, Cloudflare provider for the tunnel, DNS and WAF rules, and the AWS pieces used from home).
 - **CI on GitHub in every repo:** Terraform checks and plans in `wp-infra`; manifest validation and Kyverno policy tests in `wp-gitops`; image builds with SBOMs, scans and signing in `wp-image` and `llm-summarizer`; and the prompt evaluation gate in `llm-summarizer`. Employers see all of it without the AWS stack running.
-- **Documentation:** architecture diagrams for both environments, the cost breakdown, Grafana dashboard screenshots, sample evaluation reports comparing models, and demo recordings.
+- **Operational alerting:** alerts as code with tests and runbooks, routed to Slack by site and severity, with inhibition rules, a dead man's switch, external uptime checks and silences during demo teardown.
+- **Documentation:** architecture diagrams for both environments, the cost breakdown, Grafana dashboard screenshots, Slack alert screenshots, runbooks, sample evaluation reports comparing models, and demo recordings.
 
 ## Repository structure (four repos)
 
@@ -581,6 +639,7 @@ wp-gitops/
     aws-wp.md               # this document
     homelab-plan.md         # build plan for russetleaf.dev
     aws-eks-plan.md         # build plan for russetleaf.com
+    runbooks/               # one page per alert: what it means, how to check, how to fix
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
@@ -594,7 +653,8 @@ wp-gitops/
     seed-from-dev/          # one-off Job: load the latest russetleaf.dev backup + media into russetleaf.com
                             #   (aws only, manual sync)
   platform/                 # shared cluster services, each with base + overlays/home, overlays/aws
-    monitoring/             # kube-prometheus-stack, Grafana dashboards, alert rules
+    monitoring/             # kube-prometheus-stack, Grafana dashboards, alert rules (+ promtool tests),
+                            #   Alertmanager routing to Slack (receivers per site in the overlays)
     external-secrets/       # External Secrets Operator + AWS Secrets Manager store
     ingress/                # home: ingress-nginx; aws: AWS Load Balancer Controller
     external-dns/           # ExternalDNS, manages origin.russetleaf.com in Route 53 (aws only)
@@ -607,7 +667,7 @@ wp-gitops/
     keda/                   # KEDA operator (event-driven autoscaling)
     argo-rollouts/          # Argo Rollouts controller (canary releases)
     kyverno/                # Kyverno + policies (signed images, no :latest, resource limits,
-                            #   no privileged pods) + policy tests
+                            #   no privileged pods) + policy tests + Policy Reporter (violations to Slack)
     falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
@@ -638,6 +698,7 @@ wp-infra/
     sqs-queue/              # queue + dead-letter queue + alarms
     secrets/                # Secrets Manager entries
     bedrock-access/         # model access, gateway IAM role, Bedrock budget alert
+    alerting/               # SNS topics, CloudWatch alarms, Amazon Q Developer Slack channel configs
     ...                     # vpc, eks, karpenter, rds, elasticache, cloudfront, waf
   envs/
     aws-edge/               # russetleaf.com, ALWAYS ON (~$1/month): Route 53 hosted zone, ACM certificates
@@ -761,8 +822,8 @@ Work **infrastructure first, then code, then config**, so nothing is deployed be
 
 **russetleaf.com demo (each time):** run the `demo-up` and `demo-down` workflows in `wp-infra`, which perform these steps:
 1. `terraform apply` in `wp-infra/envs/aws`. This creates the stack (restoring RDS from the latest snapshot) and installs Argo CD pointed at `wp-gitops/bootstrap/aws`.
-2. Wait for Argo CD to sync. Once ExternalDNS creates `origin.russetleaf.com`, russetleaf.com switches from the offline page to the live site on its own. Demo.
-3. Remove the Argo CD Applications (the ALB and `origin.russetleaf.com` are deleted, and russetleaf.com falls back to the offline page), then `terraform destroy` in `envs/aws`. Never destroy `envs/aws-edge`.
+2. Wait for Argo CD to sync. Once ExternalDNS creates `origin.russetleaf.com`, russetleaf.com switches from the offline page to the live site on its own, and the workflow posts "demo started" to `#rl-com-alerts`. Demo.
+3. Silence russetleaf.com's alerts in Alertmanager, remove the Argo CD Applications (the ALB and `origin.russetleaf.com` are deleted, and russetleaf.com falls back to the offline page), then `terraform destroy` in `envs/aws`, and post "demo stopped" to `#rl-com-alerts`. Never destroy `envs/aws-edge`.
 
 ### Moving from the current repo
 The current repo (`private-test-wordpress`) becomes `wp-gitops`:

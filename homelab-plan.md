@@ -30,7 +30,10 @@ Each step is sized for one or a few Claude sessions, and ends with a **test** th
 - Create an **AWS Budget** with an email alert at about $25/month (by hand in the console is fine; Terraform takes over in step 2.1).
 - Pick an AWS region for the home lab's AWS resources (e.g. `us-east-1`) and use it everywhere.
 
-**Test:** `aws sts get-caller-identity` works; every tool prints its version.
+- **Slack:** create the project workspace and the channels from `aws-wp.md` ([Alerting and notifications](aws-wp.md#alerting-and-notifications-slack)): `#rl-critical`, `#rl-dev-alerts`, `#rl-com-alerts`, `#rl-deploys`, `#rl-security`, `#rl-mlops`, `#rl-costs`. Create the custom Slack app ("russetleaf-bot") with a bot token allowed to post to those channels, and install the **GitHub** app for Slack. Turn on phone notifications for `#rl-critical` only.
+- **Outside monitoring accounts** (free plans): a heartbeat service (e.g. healthchecks.io) and an uptime checker (e.g. UptimeRobot or Better Stack), both posting to Slack.
+
+**Test:** `aws sts get-caller-identity` works; every tool prints its version; a test message from the bot token (`curl` to Slack's `chat.postMessage`) appears in `#rl-dev-alerts`.
 
 ### Step 0.2: Decisions to make before writing code
 Record each answer in the [decision log](#decision-log).
@@ -85,7 +88,8 @@ Record each answer in the [decision log](#decision-log).
 - russetleaf.dev resources: media bucket, database-backup bucket (lifecycle: expire after 30 days), **model mirror bucket** (for the self-hosted model's file, used in step 8.1), summary queue + dead-letter queue, Secrets Manager entries (empty placeholders; values set by hand or generated), Bedrock budget alert.
 - **Email:** an SES domain identity for russetleaf.dev, with its DKIM and SPF records created in Cloudflare, and SES SMTP credentials stored in Secrets Manager. (New SES accounts are in the "sandbox" and can only send to verified addresses; verify your own address for testing, or request production access.)
 - Scoped IAM users and keys for the home cluster, one per job: External Secrets (read the russetleaf.dev secrets only), WordPress (media bucket + send to queue), MariaDB backups (backup bucket), summarizer (read from queue), LiteLLM (`bedrock:InvokeModel` on the chosen models only). Store each key in Secrets Manager.
-- Cloudflare (Cloudflare provider): the tunnel, its token (stored in Secrets Manager), DNS records for `russetleaf.dev` and `www`, basic WAF/security settings, and **Cloudflare Access** policies for admin UIs (Argo CD, Grafana) so they're never public.
+- Cloudflare (Cloudflare provider): the tunnel, its token (stored in Secrets Manager), DNS records for `russetleaf.dev` and `www`, basic WAF/security settings, **Cloudflare Access** policies for admin UIs (Argo CD, Grafana) so they're never public, and **Cloudflare notifications** (tunnel health, security events) to a Slack webhook for `#rl-dev-alerts`.
+- The Slack bot token in Secrets Manager (set by hand; Terraform creates the empty entry).
 - Bedrock: confirm access to Claude Haiku and Amazon Nova Lite in the chosen region (Anthropic models may need a one-time use-case form in the console).
 
 **Test:** with each scoped key, the allowed action works and a disallowed one fails (e.g. the WordPress key can't read the backup bucket); `aws bedrock-runtime converse` with the LiteLLM key returns a response; the tunnel shows as created in Cloudflare.
@@ -103,9 +107,10 @@ Record each answer in the [decision log](#decision-log).
 - Install Argo CD with Helm on the new cluster, then add Argo CD itself to `platform/argocd/` so it manages its own upgrades.
 - `bootstrap/home/`: the root "app of apps" that creates one Argo CD Application per component, with **sync waves** (storage and secrets first, then ingress, monitoring, operators, then apps).
 - Expose the Argo CD UI only through Cloudflare Access (after step 4.3), or use `kubectl port-forward` until then.
+- **Argo CD Notifications** to `#rl-deploys` (sync succeeded, sync failed, app degraded), using the Slack bot token. Until External Secrets exists (step 4.2), create the token Secret by hand; switch it to an `ExternalSecret` afterwards.
 - CI: render every component's home overlay (Helm/Kustomize) and validate with `kubeconform`.
 
-**Test:** apply the root app; Argo CD shows it `Synced`/`Healthy` with a trivial test component; a pull request that breaks a manifest fails CI.
+**Test:** apply the root app; Argo CD shows it `Synced`/`Healthy` with a trivial test component; a sync posts to `#rl-deploys`; a pull request that breaks a manifest fails CI.
 
 ## Phase 4: Platform services (`wp-gitops/platform/`)
 
@@ -131,14 +136,19 @@ Check `kubectl top nodes` after each step.
 **Test:** a hello-world app at `https://russetleaf.dev` loads from outside your network (e.g. on mobile data); your router has no open ports; the Argo CD hostname asks for a Cloudflare Access login.
 
 ### Step 4.4: Monitoring
-**Do:** `platform/monitoring/`: kube-prometheus-stack, trimmed for 8 GB: 7-day retention, 30–60 s scrape interval, resource limits on every part. Alertmanager sends to email (or Discord/Slack). Grafana behind Cloudflare Access.
+**Do:** `platform/monitoring/`: kube-prometheus-stack, trimmed for 8 GB: 7-day retention, 30–60 s scrape interval, resource limits on every part. Grafana behind Cloudflare Access. Then the alerting setup from `aws-wp.md`:
+- Prometheus external labels `site=dev`, `cluster=talos-home`.
+- **Alertmanager → Slack** with the bot token from External Secrets: criticals to `#rl-critical` and `#rl-dev-alerts`; warnings to `#rl-dev-alerts`; `team=security|mlops|cost` alerts to their channels; grouping and repeat intervals; **inhibition rules** (site down suppresses its downstream alerts).
+- **Dead man's switch:** route the always-firing `Watchdog` alert to the heartbeat service's URL; the heartbeat service alerts `#rl-critical` if pings stop.
+- **External uptime check** for `https://russetleaf.dev` (and, once the AWS edge exists, russetleaf.com expecting 200 or the 503 offline page).
+- **Alerts as code:** a starter set of `PrometheusRule`s (site down, pod crash-looping, node memory high, disk filling, certificate/tunnel down), each with `severity`, `summary`, `description` and `runbook_url`; a runbook for each in `docs/runbooks/`; `promtool test rules` in `wp-gitops` CI.
 
-**Test:** Grafana shows node and pod dashboards for both nodes; a test alert (e.g. a temporary rule that always fires) reaches you.
+**Test:** Grafana shows node and pod dashboards for both nodes; a test critical alert appears in both `#rl-critical` and `#rl-dev-alerts` with a working runbook link; stopping Alertmanager for longer than the heartbeat period makes the heartbeat service post to `#rl-critical`; a broken alert rule fails `promtool` in CI.
 
 ### Step 4.5: Database and cache
 **Do:**
 - `platform/mariadb/`: MariaDB Operator; a `MariaDB` instance pinned to the **same major version RDS offers** (e.g. 11.4 LTS), a `Database`, `User` and `Grant` for WordPress (passwords from External Secrets).
-- The daily **`Backup`** to the backup bucket (logical, gzip, 14-day retention), and an alert if the last successful backup is more than 26 hours old.
+- The daily **`Backup`** to the backup bucket (logical, gzip, 14-day retention), and an alert (`severity=critical`, with a runbook) if the last successful backup is more than 26 hours old.
 - `platform/valkey/`: Valkey (single instance, no persistence needed for an object cache).
 
 **Test:** connect with a MariaDB client from a test pod; trigger a backup by hand and see the file in S3; **restore it into a scratch MariaDB instance** and compare; `valkey-cli ping` returns `PONG`.
@@ -167,7 +177,7 @@ Check `kubectl top nodes` after each step.
 ### Step 5.3: Image promotion
 **Do:** create the GitHub App; the `wp-image` release workflow opens a pull request on `wp-gitops` that changes only the chart and image version in `apps/wordpress/`, linking the release notes.
 
-**Test:** merge a trivial change in `wp-image` → a signed image is pushed → a bump pull request appears in `wp-gitops` → merging it rolls out the new image.
+**Test:** merge a trivial change in `wp-image` → a signed image is pushed → a bump pull request appears in `wp-gitops` → merging it rolls out the new image, and the rollout appears in `#rl-deploys`. Subscribe `#rl-deploys` to the four repos' releases and merged pull requests with the GitHub Slack app.
 
 ## Phase 6: Policy and progressive delivery
 
@@ -179,14 +189,16 @@ Check `kubectl top nodes` after each step.
 - no privileged pods outside namespaces that need them (storage, Falco)
 - Policy tests with `kyverno test`, run in `wp-gitops` CI.
 
+- **Policy Reporter** (Kyverno's reporting add-on) sending new policy violations to `#rl-security`.
+
 Review the policy reports, fix violations, then switch to **enforce**.
 
 **Test:** in enforce mode, an unsigned image and a `:latest` image are both rejected; the existing workloads keep running; a pull request that violates a policy fails CI.
 
 ### Step 6.2: Argo Rollouts
-**Do:** `platform/argo-rollouts/`; convert WordPress to a `Rollout` with canary steps (e.g. 20% → 50% → 100%) and an `AnalysisTemplate` that queries Prometheus (ingress-nginx error rate and latency for the WordPress service).
+**Do:** `platform/argo-rollouts/`; convert WordPress to a `Rollout` with canary steps (e.g. 20% → 50% → 100%) and an `AnalysisTemplate` that queries Prometheus (ingress-nginx error rate and latency for the WordPress service). Argo Rollouts notifications post canary steps, aborts and rollbacks to `#rl-deploys`.
 
-**Test:** a good image rolls out step by step; a deliberately broken image (e.g. one that returns 500s) is **rolled back automatically**.
+**Test:** a good image rolls out step by step; a deliberately broken image (e.g. one that returns 500s) is **rolled back automatically**, and the rollback is announced in `#rl-deploys`.
 
 ### Step 6.3 (optional, needs Cilium): Network policies
 **Do:** a default-deny NetworkPolicy in each app namespace, then allow only what's needed: ingress-nginx → WordPress; WordPress → MariaDB, Valkey and the internet (S3, SQS, SES); summarizer → WordPress, the gateway and the internet (SQS); gateway → llama.cpp and the internet (Bedrock); Prometheus → everything it scrapes. Keep the policies in each component's `base/` so the AWS site can use them too.
@@ -223,9 +235,9 @@ Review the policy reports, fix violations, then switch to **enforce**.
 **Test (end to end):** publish a post on russetleaf.dev → a summarizer pod starts → the summary appears on the post within a few minutes → the pod scales back to zero. A message that always fails ends up in the dead-letter queue.
 
 ### Step 7.5: LLM monitoring
-**Do:** OpenTelemetry metrics in the summarizer (tokens, latency, errors, fallbacks, estimated cost, all labelled by model and prompt version); the Grafana LLM dashboard and `PrometheusRule` alerts shipped **in the summarizer chart** (error spike, dead-letter queue not empty, daily Bedrock spend over a limit); SQS queue depth in Grafana.
+**Do:** OpenTelemetry metrics in the summarizer (tokens, latency, errors, fallbacks, estimated cost, all labelled by model and prompt version); the Grafana LLM dashboard and `PrometheusRule` alerts shipped **in the summarizer chart** (error spike, dead-letter queue not empty, daily Bedrock spend over a limit, all labelled `team=mlops` so they go to `#rl-mlops`, with runbooks); SQS queue depth in Grafana.
 
-**Test:** the dashboard shows real numbers after a few posts; temporarily lowering the spend limit makes the alert fire.
+**Test:** the dashboard shows real numbers after a few posts; temporarily lowering the spend limit makes the alert appear in `#rl-mlops`.
 
 ## Phase 8: Self-hosted model (box 2)
 
@@ -255,6 +267,7 @@ Review the policy reports, fix violations, then switch to **enforce**.
 **Do:**
 - Pull request workflow (on ARC runners): run the evaluation, post per-model scores as a pull request comment compared with `main`, fail below the threshold.
 - Release workflow: run the gate again, then publish (step 7.4), attach the report to the GitHub release, update `MODEL_CARD.md`.
+- Post gate results (pass/fail, per-model scores, link to the report) to `#rl-mlops`.
 - Optionally convert the summarizer to an Argo Rollouts canary.
 
 **Test:** a pull request with a deliberately bad prompt fails the gate with a clear comment; a good one passes; a release tag publishes only after the gate passes.
@@ -262,9 +275,9 @@ Review the policy reports, fix violations, then switch to **enforce**.
 ## Phase 10: Runtime security, compliance and cost
 
 ### Step 10.1: Falco
-**Do:** `platform/falco/`: Falco with the **modern eBPF** driver (Talos doesn't allow kernel modules), Falcosidekick to Alertmanager/Grafana, and custom rules: shell in WordPress, summarizer or gateway pods; writes under `/var/www/html`; unexpected outbound connections from box 2.
+**Do:** `platform/falco/`: Falco with the **modern eBPF** driver (Talos doesn't allow kernel modules), Falcosidekick to Alertmanager, Grafana and Slack (`#rl-security`, warning priority and above), and custom rules: shell in WordPress, summarizer or gateway pods; writes under `/var/www/html`; unexpected outbound connections from box 2.
 
-**Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana; creating a file under `/var/www/html` triggers another.
+**Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana and `#rl-security`; creating a file under `/var/www/html` triggers another.
 
 ### Step 10.2: Trivy Operator and Talos hardening notes
 **Do:** `platform/trivy-operator/` with modest scan concurrency (it's memory hungry on 8 GB); write `docs/talos-hardening.md` explaining how Talos meets the CIS benchmark (no shell or SSH, read-only system, API-only management, default pod security).
@@ -301,6 +314,8 @@ These keep russetleaf.dev healthy once it's running. Add each as a calendar remi
 | Check for Terraform drift | Weekly | A scheduled `terraform plan` in `wp-infra` CI for the AWS and Cloudflare resources (alerts if anything changed outside Terraform) |
 | Rotate scoped IAM keys | Every 90 days, until step 11.1 removes them | Create a new key in Terraform, update Secrets Manager, let External Secrets sync it, delete the old key |
 | Review alerts, costs and Bedrock spend | Monthly | Grafana, OpenCost, the AWS Budget and Cost Explorer (filter by `Site=dev`) |
+| Review alert noise | Monthly | Look at what fired in the Slack channels: remove or tune alerts nobody acted on, and update runbooks that didn't help |
+| Test the outside monitoring | Quarterly | Pause the heartbeat or block the uptime check and confirm `#rl-critical` is notified |
 
 ## Deferred to the AWS phase
 
@@ -329,7 +344,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 4.1 Storage | ☐ | | | |
 | 4.2 Secrets | ☐ | | | |
 | 4.3 Ingress + tunnel | ☐ | | | |
-| 4.4 Monitoring | ☐ | | | |
+| 4.4 Monitoring + Slack alerting | ☐ | | | |
 | 4.5 MariaDB + backups + Valkey | ☐ | | | |
 | 5.1 WordPress image | ☐ | | | |
 | 5.2 WordPress deployment | ☐ | | | |
