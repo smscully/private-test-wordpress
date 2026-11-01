@@ -29,6 +29,8 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Email | Amazon SES, its own domain identity (DKIM records in Route 53) | Amazon SES, its own domain identity (DKIM records in Cloudflare) |
 | Networking (CNI) | **Cilium** in chaining mode with the Amazon VPC CNI | **Cilium** as the full CNI (replaces Flannel and kube-proxy) |
 | Network policies | **CiliumNetworkPolicies** (default-deny, DNS-name egress rules), enforced by Cilium | **CiliumNetworkPolicies**, same base policies |
+| Encryption in transit | TLS on sensitive connections; Cilium WireGuard between nodes, if supported in chaining mode | TLS on sensitive connections; Cilium WireGuard between nodes |
+| Service mesh | None, by decision (ADR) | None, by decision (ADR) |
 | Network visibility | Hubble + Hubble UI (port-forward), metrics in Prometheus | Hubble + Hubble UI (Cloudflare Access), metrics in Prometheus |
 | AWS resource tags | `Project=russetleaf`, `Site=com` | `Project=russetleaf`, `Site=dev` |
 | Self-hosted model | llama.cpp (CUDA build) on a Karpenter GPU node | llama.cpp (CPU build) on box 2 |
@@ -132,6 +134,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
   - The LLM gateway may call `bedrock:InvokeModel` on the chosen Bedrock models only.
 - **No application database password on russetleaf.com:** WordPress logs in to RDS Proxy with IAM auth tokens; the master password is generated and rotated by RDS. At home, MariaDB Operator generates and rotates the passwords. See [Database access and credentials](#database-access-and-credentials).
 - Other secrets (API tokens, SMTP credentials, the Slack token) in **AWS Secrets Manager**, synced into the cluster by **External Secrets Operator**.
+- **Encryption in transit:** TLS on every sensitive connection, plus Cilium's **WireGuard** encryption for pod traffic between nodes. No service mesh, by a recorded decision; see [Service mesh (Istio): not used, by decision](#service-mesh-istio-not-used-by-decision).
 - **CiliumNetworkPolicies** (Cilium on both clusters): default-deny in each application namespace, then only the connections each workload needs (e.g. only WordPress may reach the database), with outbound traffic to AWS allowed **by DNS name**; see [Networking: Cilium and Hubble](#networking-cilium-and-hubble).
 - RDS in **private subnets**, with **TLS required** on connections.
 - `DISALLOW_FILE_MODS` set to `true` (no plugin or theme installs from the admin screen).
@@ -245,6 +248,38 @@ spec:
 - A **Kyverno generate rule** adds the default-deny baseline's per-namespace allowances when a new application namespace is created, so no namespace is ever left open.
 - Policies are tested in CI: rendered and schema-checked with the Cilium CRD schemas (kubeconform), and exercised in the ci kind cluster (which also runs Cilium).
 - Falco's "unexpected outbound connection" rule **detects**; the FQDN egress policies **prevent**. Each covers the other's gaps.
+
+### Encryption in transit: Cilium WireGuard
+Sensitive connections already use TLS at the application level (WordPress → database, everything → AWS APIs, CloudFront → ALB). On top of that, Cilium's **transparent encryption** encrypts **all pod-to-pod traffic between nodes** with **WireGuard**, with no changes to the applications:
+
+```yaml
+encryption:
+  enabled: true
+  type: wireguard
+  nodeEncryption: false        # pod traffic only; node-to-node host traffic is left as is
+```
+
+- **Home:** the Talos kernel includes WireGuard, so this is a Cilium setting only. WireGuard encrypts traffic **between** nodes; on the home lab, that's mainly box 1 ↔ box 2 (the gateway ↔ llama.cpp, ARC runners ↔ the gateway). Traffic between pods on the same node never leaves the machine.
+- **EKS:** confirm that Cilium's WireGuard encryption is supported in **chaining mode** with the VPC CNI for the Cilium version you install. If it is, turn it on the same way. If not, record that in the service-mesh ADR (below) and rely on the application-level TLS already on every sensitive connection.
+- **Cost:** a small amount of CPU for encryption, almost no memory.
+- **Check:** `cilium encrypt status` (or `cilium status`) shows WireGuard enabled with a peer for each other node.
+
+### Service mesh (Istio): not used, by decision
+The project deliberately has **no service mesh**. The reasoning is recorded as an **architecture decision record (ADR)**, `docs/adr/0001-no-service-mesh.md` in `wp-gitops`:
+
+| What a mesh like Istio would add | How this design already covers it |
+|---|---|
+| mTLS between services | Cilium WireGuard encryption between nodes, plus TLS on every sensitive connection; per-connection service *identity* checks are the one thing not covered |
+| Layer-7 authorization | CiliumNetworkPolicies with layer-7 rules |
+| Traffic shifting for canaries | Argo Rollouts (through ingress-nginx and the ALB) for code; the LiteLLM gateway for models |
+| Retries, timeouts, circuit breaking | The SQS queue with retries and a dead-letter queue; LiteLLM's retries and fallbacks |
+| Per-service request metrics | Hubble HTTP metrics, ingress/ALB metrics, and the apps' own OpenTelemetry metrics |
+
+**Why not:** about four services talk to each other (WordPress, summarizer, gateway, model server), so a mesh's benefits are small. Its costs are not: classic Istio adds a proxy to every pod (roughly 50–100 MB each) plus `istiod` (~300–500 MB), which box 1 can't afford; even Istio's lighter **ambient mode** (no per-pod proxies) adds a few hundred MB, a second policy system overlapping Cilium's, and more to upgrade and debug.
+
+**When this would change** (also in the ADR): many more services calling each other, a requirement to verify service identity on every connection (e.g. a compliance rule), or traffic between several clusters.
+
+**Optional experiment:** try **Istio ambient mode** in a local kind cluster with Cilium (home plan step 6.4), or on EKS during a demo where memory isn't tight (AWS plan step 5.3), and add the findings (memory used, setup issues with Cilium, what it added) to the ADR. Neither site depends on it.
 
 ### Hubble: network-flow visibility
 - **Hubble** (built into the Cilium agent), **Hubble Relay** (cluster-wide view) and **Hubble UI** are enabled on both clusters. Hubble UI is behind **Cloudflare Access** at home and reached by `kubectl port-forward` on EKS.
@@ -829,7 +864,8 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **A four-repo GitOps structure:** infrastructure, deployment config, the WordPress image and the summarizer are separated by purpose and permissions, with automated, reviewed promotion of signed images and charts into the GitOps repo.
 - **LLM monitoring:** token, latency, error, fallback and cost metrics per model and prompt version, plus model-server throughput, in Prometheus and Grafana, with alerts.
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
-- **Zero-trust networking with Cilium on both clusters:** default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
+- **Architecture decision records:** documented choices with their trade-offs, e.g. why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
+- **Zero-trust networking with Cilium on both clusters:** WireGuard encryption between nodes, default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
 - **Supply-chain security and policy as code:** SBOMs, vulnerability scans and signed images in CI, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov on the Terraform.
 - **Runtime security and compliance:** Falco rules written for this application (shells in pods, writes to WordPress code, unexpected egress from LLM nodes), alerts in Grafana, CIS benchmark reports from kube-bench on EKS, and continuous Trivy Operator compliance reports on both clusters.
 - **Cost awareness (FinOps):** OpenCost shows cost per namespace and workload, including the GPU node and cost per summary, next to the Bedrock spend.
@@ -883,6 +919,7 @@ wp-gitops/
     homelab-plan.md         # build plan for russetleaf.dev
     aws-eks-plan.md         # build plan for russetleaf.com
     runbooks/               # one page per alert: what it means, how to check, how to fix
+    adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/

@@ -159,6 +159,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
 - In `wp-gitops`: move `aws-wp.md` and this file to `docs/`, and write the hub README (what the project is, links to all four repos).
@@ -180,11 +181,11 @@ Record each answer in the [decision log](#decision-log).
 - Generate machine secrets; machine configs for **box 1 (control plane, schedulable)** and **box 2 (worker)**.
 - Box 2: node label `workload=llm`, taint `dedicated=llm:NoSchedule`.
 - Both nodes: kubelet extra mount for `/var/local-path-provisioner` (needed in step 4.1).
-- **Cilium:** in the machine config, set `cluster.network.cni.name: none` and `cluster.proxy.disabled: true` (Cilium replaces kube-proxy). Install Cilium with Terraform's Helm provider right after bootstrap (nothing else can run without a CNI), using Talos's documented Cilium values: `kubeProxyReplacement: true`, `k8sServiceHost: localhost`, `k8sServicePort: 7445` (KubePrism), and the cgroup and capability settings Talos requires. Turn on Hubble and Hubble Relay. Keep Cilium's ServiceMonitors **off** here (the Prometheus Operator doesn't exist yet; step 4.4 turns them on). Use `lifecycle { ignore_changes }` so Terraform installs Cilium once and Argo CD manages it afterwards (step 3.1).
+- **Cilium:** in the machine config, set `cluster.network.cni.name: none` and `cluster.proxy.disabled: true` (Cilium replaces kube-proxy). Install Cilium with Terraform's Helm provider right after bootstrap (nothing else can run without a CNI), using Talos's documented Cilium values: `kubeProxyReplacement: true`, `k8sServiceHost: localhost`, `k8sServicePort: 7445` (KubePrism), and the cgroup and capability settings Talos requires. Turn on Hubble and Hubble Relay, and **WireGuard transparent encryption** (`encryption.enabled: true`, `encryption.type: wireguard`). Keep Cilium's ServiceMonitors **off** here (the Prometheus Operator doesn't exist yet; step 4.4 turns them on). Use `lifecycle { ignore_changes }` so Terraform installs Cilium once and Argo CD manages it afterwards (step 3.1).
 - Apply configs, bootstrap etcd, output kubeconfig and talosconfig (save them outside Git).
 - Install **metrics-server** here or in step 4.1, so `kubectl top` works.
 
-**Test:** `kubectl get nodes` shows both nodes `Ready`; `kubectl describe node <box2>` shows the label and taint; `talosctl health` passes; `cilium status` is all green and `cilium connectivity test` passes; there's no kube-proxy DaemonSet. Rebuild once from scratch to prove it's reproducible.
+**Test:** `kubectl get nodes` shows both nodes `Ready`; `kubectl describe node <box2>` shows the label and taint; `talosctl health` passes; `cilium status` is all green and `cilium connectivity test` passes; `cilium encrypt status` shows WireGuard on with box 1 and box 2 as peers; there's no kube-proxy DaemonSet. Rebuild once from scratch to prove it's reproducible.
 
 ### Step 2.3: AWS and Cloudflare resources for the home lab
 **Do** (`wp-infra/modules/` + `envs/home/`):
@@ -352,6 +353,13 @@ Review the policy reports, fix violations, then switch to **enforce**.
 
 **Test:** from a test pod in another namespace, MariaDB is unreachable; from a WordPress pod, `curl https://example.com` is **blocked** while uploads to S3 still work; a non-REST-API request from the summarizer to WordPress is blocked at layer 7; a burst of blocked requests triggers `HubblePolicyDropsSpike` in `#rl-security`; the site, the summarizer, backups and monitoring all still work.
 
+### Step 6.4: Service mesh decision (ADR) and optional Istio experiment
+**Do:**
+- Write `docs/adr/0001-no-service-mesh.md`: what a mesh like Istio would add, how Cilium (WireGuard, layer-7 policies, Hubble), Argo Rollouts and LiteLLM already cover it, the memory and complexity cost on 8 GB nodes, and **when you'd revisit** (many more services, a requirement to verify service identity on every connection, multi-cluster traffic). See [Service mesh (Istio): not used, by decision](aws-wp.md#service-mesh-istio-not-used-by-decision).
+- **Optional experiment (local only):** in a kind cluster on your workstation running Cilium, install **Istio ambient mode** (following Istio's instructions for running alongside Cilium), deploy the WordPress chart with test values, and enable mTLS and one layer-7 authorization policy. Record memory use, setup issues and what it added in the ADR. Delete the cluster afterwards; nothing in either site depends on it.
+
+**Test:** the ADR is reviewed and linked from the hub README and the decision log; if the experiment was run, its findings are in the ADR.
+
 ## Phase 7: AI post summaries
 
 ### Step 7.1: KEDA
@@ -508,6 +516,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 6.1 Kyverno | ☐ | | | |
 | 6.2 Argo Rollouts | ☐ | | | |
 | 6.3 CiliumNetworkPolicies | ☐ | | | |
+| 6.4 Service mesh ADR (+ optional Istio experiment) | ☐ | | | |
 | 7.1 KEDA | ☐ | | | |
 | 7.2 LiteLLM gateway | ☐ | | | |
 | 7.3 Summarizer code | ☐ | | | |

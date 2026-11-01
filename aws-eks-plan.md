@@ -90,12 +90,12 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - EKS cluster with a small **managed node group** (2 nodes, e.g. t3.medium) for Karpenter, CoreDNS and other system pods.
 - Add-ons: VPC CNI (with its own network policy enforcement **off**, since Cilium enforces policies), CoreDNS, kube-proxy, **EBS CSI driver**, **Pod Identity agent**.
-- **Cilium in chaining mode**, installed by Terraform's Helm provider right after the cluster and managed node group exist: `cni.chainingMode: aws-cni`, `cni.exclusive: false`, `enableIPv4Masquerade: false`, `routingMode: native`; Hubble and Hubble Relay on; ServiceMonitors **off** until monitoring exists (step 2.4); `lifecycle { ignore_changes }` so Argo CD manages it afterwards from `platform/cilium/overlays/aws`. Restart any pods that started before Cilium (e.g. CoreDNS) so Cilium manages them.
+- **Cilium in chaining mode**, installed by Terraform's Helm provider right after the cluster and managed node group exist: `cni.chainingMode: aws-cni`, `cni.exclusive: false`, `enableIPv4Masquerade: false`, `routingMode: native`; Hubble and Hubble Relay on; **WireGuard transparent encryption** on, **if** the Cilium version you install supports it in chaining mode with the VPC CNI (check Cilium's documentation; if it doesn't, leave it off and record that in `docs/adr/0001-no-service-mesh.md`, relying on the TLS already on every sensitive connection); ServiceMonitors **off** until monitoring exists (step 2.4); `lifecycle { ignore_changes }` so Argo CD manages it afterwards from `platform/cilium/overlays/aws`. Restart any pods that started before Cilium (e.g. CoreDNS) so Cilium manages them.
 - A Kubernetes version within **standard support**. EKS charges about six times more per hour for clusters on versions in extended support.
 - Access entries: your admin role, and the CI apply role.
 - Control plane logging: audit logs only, short retention (they're the useful ones and cost little).
 
-**Test:** `kubectl get nodes` shows the managed nodes; `cilium status` is green and `cilium connectivity test` passes; a gp3 PersistentVolumeClaim binds; tear down.
+**Test:** `kubectl get nodes` shows the managed nodes; `cilium status` is green and `cilium connectivity test` passes; if WireGuard is on, `cilium encrypt status` lists the other nodes as peers; a gp3 PersistentVolumeClaim binds; tear down.
 
 ### Step 1.5: Karpenter infrastructure
 **Do:** Karpenter's IAM (controller role via Pod Identity, node role and instance profile), the **interruption SQS queue** with EventBridge rules (spot interruption, rebalance, instance state change), and the Karpenter Helm release installed by Terraform (NodePools come from GitOps in step 2.3).
@@ -218,7 +218,7 @@ Record each answer in the [decision log](#decision-log).
 ## Phase 5: Security and cost review
 
 ### Step 5.1: Security review
-**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
+**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); pod traffic between nodes is encrypted (WireGuard), or the ADR explains why not; CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
 
 **Test:** a written checklist in `docs/` with each item checked.
 
@@ -226,6 +226,11 @@ Record each answer in the [decision log](#decision-log).
 **Do:** after a full demo, compare **AWS Cost Explorer** (filtered by the `Project` and `Stack` tags) with the estimates in `aws-wp.md`, and with OpenCost.
 
 **Test:** actual cost per demo hour is recorded in the decision log, and `aws-wp.md` is updated if the estimates were off.
+
+### Step 5.3 (optional): Istio ambient experiment on EKS
+**Do:** during a demo session, install **Istio ambient mode** alongside Cilium on the EKS cluster (Istio's instructions for running with Cilium), add the WordPress and summarizer namespaces to the mesh, and try mTLS plus one layer-7 authorization policy. Measure the extra memory and latency, note any conflicts with Cilium's policies, then remove it before `demo-down`. Add the findings to `docs/adr/0001-no-service-mesh.md`. Nothing in the site depends on it.
+
+**Test:** the ADR includes the EKS findings (resource use, latency, setup issues, what it added), and Istio is fully removed afterwards.
 
 ## Phase 6: Demo operations
 
@@ -287,6 +292,7 @@ Record each answer in the [decision log](#decision-log).
 | 4.3 Evaluation on AWS | ☐ | | | |
 | 5.1 Security review | ☐ | | | |
 | 5.2 Cost review | ☐ | | | |
+| 5.3 Istio ambient experiment (optional) | ☐ | | | |
 | 6.1 Demo workflows | ☐ | | | |
 | 6.2 Rehearsal + recording | ☐ | | | |
 | 6.3 Documentation | ☐ | | | |
