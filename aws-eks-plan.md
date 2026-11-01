@@ -9,8 +9,14 @@ Each step ends with a **test** that must pass before moving on. Unlike the home 
 - **Start each session** with something like: *"Read `aws-wp.md`, `homelab-plan.md` and `aws-eks-plan.md`. We're working on AWS step 2.3. Here's where I left off: ..."*.
 - **One step at a time.** Build it, run the step's test, fix, commit, and **tear down** anything expensive before ending the session.
 - **Check for leftovers after every session.** Every resource is tagged (see step 0.2); search by tag (AWS Resource Explorer or the Tag Editor) to confirm nothing from `envs/aws` is still running. Check the AWS Budget the next day.
-- **Change the AWS overlay only.** Put AWS-specific settings in `overlays/aws`. If the base needs changing, test the change on the home lab first, so russetleaf.dev never breaks.
+- **Change the AWS overlay only.** Put AWS-specific settings in `overlays/aws`. If the base needs changing, send the change through the home lab's environments first (local → ci → staging → russetleaf.dev), so russetleaf.dev never breaks. Application versions reach `overlays/aws` through the same `promote-to-prod` pull requests as russetleaf.dev.
 - **Keep the plan current.** Tick the [progress checklist](#progress-checklist), record actual costs, and add to the [decision log](#decision-log).
+
+## Workstation
+
+Use the same Ubuntu 24.04 setup as the home lab ([Local workstation setup](homelab-plan.md#local-workstation-setup-ubuntu-2404)). Additions for AWS:
+- An AWS SSO profile for the demo account (or the same account), and `aws eks update-kubeconfig --name <cluster> --alias eks-com --profile <profile>` after each `demo-up`, so the kubeconfig context is clearly named.
+- Nothing else to install: `terraform`, `kubectl`, `helm`, `argocd` and the AWS CLI from the home lab setup cover EKS. Pin the `kubectl` version in `wp-infra`'s `.mise.toml` within one minor version of the EKS version.
 
 ## Prerequisites from the home lab
 
@@ -26,6 +32,7 @@ These home lab steps must be done first, because this plan builds on them:
 | 4.x Platform services | Base manifests for External Secrets, monitoring, Kyverno, Argo Rollouts, KEDA, Falco, Trivy Operator, OpenCost |
 | 4.5 MariaDB backups | The russetleaf.dev backups used to seed russetleaf.com |
 | 5.1–5.3 WordPress | The image, the chart and image promotion |
+| 5.4–5.7 Environments | ci test clusters, ARC runners, on-demand staging and the promotion pipeline (which also bumps `overlays/aws`) |
 | 6.1–6.2 Policy and rollouts | Kyverno policies, the Rollout definition |
 | 7.x Summarizer | The summarizer image and chart, gateway config, LLM dashboards and alerts |
 | 9.x MLOps pipeline | The evaluation set and gate (they stay on the home lab's runners) |
@@ -118,9 +125,9 @@ Record each answer in the [decision log](#decision-log).
 **Test:** Argo CD lists the AWS root app (it will show missing components until Phase 2), and its first sync appears in `#rl-deploys`.
 
 ### Step 1.9: `wp-infra` CI for AWS
-**Do:** extend CI to plan `envs/aws-edge` and `envs/aws` on pull requests. Applies are done by the demo workflows (Phase 6) or locally, never automatically on merge, so merging never starts a paid stack.
+**Do:** extend CI to plan `envs/aws-edge` and `envs/aws` on pull requests, and run **`terraform test`** (with mocked providers where possible) for the AWS-specific modules (`alerting`, the CloudFront edge, RDS restore logic). Applies are done by the demo workflows (Phase 6) or locally, never automatically on merge, so merging never starts a paid stack.
 
-**Test:** a pull request shows plans for all three environments.
+**Test:** a pull request shows plans for all three environments, and `terraform test` passes (and fails on a deliberately broken module input).
 
 ## Phase 2: AWS platform (`wp-gitops`)
 

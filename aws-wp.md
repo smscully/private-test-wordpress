@@ -2,7 +2,7 @@
 
 EKS, the WordPress Helm chart, S3 media offload and RDS together make a standard production design for WordPress on AWS. The design alone doesn't make the site production-ready: that comes from how each piece is configured, as described below. The design also adds **AI-generated post summaries**, run as an event-driven, monitored and tested LLM service. Summaries go through an **LLM gateway** that routes between **Amazon Bedrock** models and a **self-hosted model** on dedicated LLM nodes.
 
-The project runs **two separate WordPress sites** from the same code and manifests: **russetleaf.com** on the full AWS design (brought up only for demos) and **russetleaf.dev** on a budget home lab (running 24/7). See [The two sites](#the-two-sites).
+The project runs **two separate WordPress sites** from the same code and manifests: **russetleaf.com** on the full AWS design (brought up only for demos) and **russetleaf.dev** on a budget home lab (running 24/7). See [The two sites](#the-two-sites). Changes reach them through **local → ci → staging → prod** environments; see [Environments and promotion](#environments-and-promotion).
 
 Step-by-step build plans: [`homelab-plan.md`](homelab-plan.md) (russetleaf.dev, built first) and [`aws-eks-plan.md`](aws-eks-plan.md) (russetleaf.com, built second).
 
@@ -33,6 +33,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Terraform environment (`wp-infra`) | `envs/aws-edge` (always on) + `envs/aws` (demo stack) | `envs/home` |
 | GitOps overlay (`wp-gitops`) | `overlays/aws` | `overlays/home` |
 | Alerts (Slack) | `#rl-com-alerts` (+ `#rl-critical` for criticals) | `#rl-dev-alerts` (+ `#rl-critical` for criticals) |
+| Environments | prod only (demo); versions arrive after passing home staging and russetleaf.dev | local → ci → staging (on demand) → prod |
 | Monthly cost | ~$1 always on, plus ~$1/hour during demos | ~$8–$15 |
 
 Running MariaDB and Valkey inside the home cluster, instead of RDS and ElastiCache, is the biggest saving in the home lab: those two managed services alone would cost about $130/month at the AWS design's sizes. Both sites use the **MariaDB** engine (in-cluster at home, RDS for MariaDB on AWS), so database backups move between them without conversion.
@@ -174,7 +175,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 - **Metrics, logs and alerts**: Prometheus, Grafana and Alertmanager (or CloudWatch Container Insights), including the LLM metrics described below, with every alert routed to **Slack** by site and topic; see [Alerting and notifications](#alerting-and-notifications-slack).
 - **Deployment notifications**: Argo CD and Argo Rollouts post syncs, failures, canary steps and rollbacks to `#rl-deploys`.
 - **AWS Budgets alerts**, including one on Bedrock spending, in case a bug calls the model in a loop.
-- **Tagging**: every AWS resource gets `Project`, `Site` and `ManagedBy` tags (plus `Stack=edge|demo` on russetleaf.com) through the AWS provider's `default_tags`, so leftovers can be found and costs split per site.
+- **Tagging**: every AWS resource gets `Project`, `Site`, `Env` and `ManagedBy` tags (plus `Stack=edge|demo` on russetleaf.com) through the AWS provider's `default_tags`, so leftovers can be found and costs split per site.
 
 ### WordPress image and Helm chart
 The site uses a **custom image built on the official `wordpress` image** and a **small Helm chart of its own** (Deployment/Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob), both maintained in the `wp-image` repo and released together. The Bitnami WordPress chart isn't used: it only works with Bitnami-format images, and Bitnami cut back its free images in 2025. Owning the chart removes that dependency and keeps every setting visible.
@@ -248,15 +249,17 @@ One Slack workspace for the project. The free plan is enough: it keeps 90 days o
 | `#rl-security` | Falco alerts, Kyverno policy violations, critical vulnerabilities in running images | Falcosidekick, Policy Reporter (Kyverno's reporting add-on), Trivy Operator metrics → Alertmanager |
 | `#rl-mlops` | Evaluation gate results, summarizer releases, Bedrock spend, dead-letter queue, model server down | GitHub, Alertmanager |
 | `#rl-costs` | AWS Budgets, Cost Anomaly Detection, weekly OpenCost summary | Amazon Q Developer in chat applications (formerly AWS Chatbot), Alertmanager |
+| `#rl-staging` | Staging test runs: started, passed, failed (with results); staging alerts | `staging-test` workflow, Alertmanager (`env=staging`) |
 
 Every message carries a **`site=dev` or `site=com` label** (or a `[dev]` / `[com]` prefix), so the shared channels still show which site it came from.
 
 ### How alerts are routed
-- **Site labels:** each cluster's Prometheus adds `site` (`dev` or `com`) and `cluster` (`talos-home` or `eks`) to everything it sends, as external labels.
+- **Site and environment labels:** each cluster's Prometheus adds `site` (`dev` or `com`) and `cluster` (`talos-home` or `eks`) to everything it sends, as external labels. Workloads carry an `env` label (`staging` or `prod`), which alerts inherit.
 - **Alertmanager routing:**
   - `severity=critical` → `#rl-critical` **and** the site's channel
   - `severity=warning` → the site's channel
   - alerts labelled `team=security`, `team=mlops` or `team=cost` → `#rl-security`, `#rl-mlops` or `#rl-costs`
+  - `env=staging` alerts → `#rl-staging` only (never `#rl-critical`)
   - grouped by alert name and site, with repeat intervals (e.g. 4 hours for warnings, 1 hour for criticals) so ongoing problems don't spam the channel
 - **Inhibition rules:** when a site is down, its downstream alerts (WordPress errors, summarizer failures, etc.) are suppressed, so the one alert that matters stands out.
 - **One Slack app for the clusters:** a custom Slack app (e.g. "russetleaf-bot") with a bot token, used by Alertmanager, Argo CD Notifications, Argo Rollouts, Falcosidekick and Policy Reporter. The token lives in **Secrets Manager** and reaches each cluster through External Secrets; it's never in Git.
@@ -284,6 +287,54 @@ A cluster can't report that it's completely down, so two outside checks back up 
 
 ### Cost
 **$0.** Slack's free plan, the heartbeat service and the uptime checker's free plans, Amazon Q Developer in chat applications, and SNS at this volume are all free.
+
+## Environments and promotion
+
+Changes never go straight to a live site. Every change to the WordPress image, the summarizer or the shared manifests moves through **local → ci → staging → prod**, and only reaches russetleaf.com after it has run on russetleaf.dev.
+
+**Naming:** "dev" in russetleaf.dev is part of the domain name, not an environment. russetleaf.dev is the home lab's **production** site. Environments are labelled explicitly everywhere (Kubernetes labels, Prometheus external labels, AWS tags) with `env=local|ci|staging|prod`, alongside `site=dev|com`.
+
+### The environments
+
+| Environment | Where it runs | Purpose | When it runs | Cost |
+|---|---|---|---|---|
+| **local** | Your Ubuntu workstation: Docker Compose, plus a local Kubernetes cluster (kind, or Talos in Docker with `talosctl cluster create`) | Fast build-and-try loop for the image, charts and summarizer; rehearse Talos upgrades and manifest changes | On demand | $0 |
+| **ci** | A temporary **kind** cluster inside GitHub Actions, created for each pull request | Install the changed charts and run integration tests against **LocalStack** (local stand-ins for S3, SQS and Secrets Manager) and a **mock LLM** (LiteLLM's mock responses), so no AWS account or model is needed | Minutes per pull request | $0 (GitHub-hosted runners are free for public repos) |
+| **staging** | The home cluster, in its own namespaces, at `staging.russetleaf.dev` behind Cloudflare Access | Run each new version against **real** AWS services and real models, with real (scrubbed) content, before production | **On demand only (scale-to-zero):** created for each promotion, deleted when tests finish | ~$0–1/month; ~0.7–1 GB of box 1's memory, only while running |
+| **prod (home)** | russetleaf.dev | The live site | 24/7 | see the home lab costs |
+| **prod (AWS demo)** | russetleaf.com | The full production design, for demos | On demand | see the AWS costs |
+
+AWS has no separate staging: russetleaf.com is already temporary, its Terraform is checked with `plan`, `terraform test` and Checkov before each demo, and its application versions have already passed home staging and production.
+
+### ci: test clusters in GitHub Actions
+- **Charts and images** (`wp-image`, `llm-summarizer`): each pull request creates a kind cluster, installs the chart with the `ci` values (LocalStack endpoints, mock LLM, test credentials), and runs integration tests:
+  - WordPress: the site installs and loads, an upload lands in the LocalStack S3 bucket, publishing a post sends a message to the LocalStack SQS queue
+  - Summarizer: a queued post gets a (mock) summary written back to WordPress; a failing message ends up in the dead-letter queue
+- **Manifests** (`wp-gitops`): pull requests render and validate every overlay (as before), and changes to shared platform components are installed into a kind cluster to check they start.
+- **LocalStack note:** LocalStack's free-tier terms have changed over time. If its current terms don't suit, use **MinIO** (S3) and **ElasticMQ** (SQS) instead, with a plain Kubernetes Secret in place of Secrets Manager.
+
+### staging: on-demand, scale-to-zero
+Box 1 doesn't have memory to spare for an always-on staging copy, so staging exists **only while it's being tested**:
+- **Staging Argo CD Applications** (WordPress, a small MariaDB, the summarizer) are in Git under `overlays/home-staging`, but with **auto-sync off**. When idle, nothing is deployed and staging uses no memory.
+- **The `staging-test` workflow** (in `wp-gitops`, on the in-cluster ARC runners, using an Argo CD account limited to the staging project) runs each time a staging version changes:
+  1. Syncs the staging Applications and waits until they're healthy.
+  2. Runs the **data Job**: copies the latest russetleaf.dev production backup from S3, imports it into the staging MariaDB, and **scrubs personal data** (user emails, commenter names and emails, application passwords) before anything else touches it.
+  3. Runs the **smoke-test Job**: the home page and a few posts load, an upload goes to the staging S3 bucket, publishing a post produces a summary through the real gateway and real Bedrock models.
+  4. **Soaks** briefly (e.g. 30 minutes), checking Prometheus for errors and crash loops.
+  5. Records the results, then **deletes** the staging Applications and their volumes (with cascade), returning staging to zero.
+- **Separate everything at runtime:** staging has its own namespaces, MariaDB instance (no Valkey, to save memory), media bucket, SQS queue, Secrets Manager entries and a **LiteLLM key with its own small Bedrock budget**. It shares the gateway and the llama.cpp model with production. Its IAM key can **read** the production backup bucket but write only to staging resources.
+- **Alerts:** `env=staging` alerts go only to `#rl-staging`, never to `#rl-critical`.
+
+### How a change is promoted
+1. **Pull request** in `wp-image` or `llm-summarizer`: unit tests, the **ci** kind-cluster tests, and (for the summarizer) the evaluation gate on the home runners.
+2. **Release:** CI builds, scans, signs and publishes the image and chart, then the bot opens a pull request bumping the version in **`overlays/home-staging`**. It **merges automatically** once `wp-gitops` CI passes.
+3. **Staging test:** the merge starts the `staging-test` workflow (above). Results are posted to `#rl-staging`.
+4. **Promotion to prod:** if staging passed, the bot opens a pull request bumping the same version in **`overlays/home`** (russetleaf.dev) **and `overlays/aws`** (russetleaf.com), with the staging results and release notes attached. **You review and merge.** If staging failed, the bot posts the failure to `#rl-staging` and `#rl-deploys`, and nothing is promoted.
+5. **Production rollout:** Argo CD syncs russetleaf.dev, and the Argo Rollouts canary is the last check. The next russetleaf.com demo deploys the same version.
+
+Infrastructure changes follow the same idea with different tools: Terraform modules are tested with **`terraform test`** in CI, Talos version upgrades are rehearsed on a **local Talos-in-Docker cluster** first, and `envs/home` changes are planned in CI before being applied.
+
+**Kargo (optional, later):** Kargo, a GitOps promotion tool from the makers of Argo CD, can replace the promotion workflows with a visual pipeline (stages, verification, approvals). It's a good portfolio addition, but its controllers are always on, so add it only if box 1 has memory to spare. The workflows above are the lightweight default.
 
 ## Example Helm values (outline)
 
@@ -561,6 +612,8 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Runtime security | Falco + Falcosidekick | Same (or GuardDuty EKS Runtime Monitoring) | $0 |
 | Compliance | Talos hardened defaults (documented) + Trivy Operator | kube-bench (EKS profile) + Trivy Operator | $0 |
 | Cost visibility | OpenCost | OpenCost or Kubecost EKS bundle | $0 |
+| Staging (on demand) | Created per promotion on the home cluster, deleted after tests; own bucket, queue, secrets, small Bedrock budget | None (AWS versions are tested at home first) | ~$0–1 |
+| ci test clusters | kind in GitHub Actions with LocalStack and a mock LLM | Same | $0 |
 | Alerting | Alertmanager → Slack, dead man's switch, uptime checks, Cloudflare notifications | Same, plus CloudWatch alarms via SNS and Amazon Q Developer | $0 |
 | russetleaf.com always-on edge | n/a | Route 53 zone, CloudFront, offline page, media bucket, RDS snapshot (`envs/aws-edge`) | ~$1 |
 | **Total (24/7)** | | | **~$8–$15 / month** |
@@ -596,6 +649,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Pod permissions without stored keys at home (stretch goal):** publish the Talos cluster's service-account OIDC discovery files (e.g. in a public S3 bucket) and register them as an IAM OIDC provider. Pods such as WordPress (S3, SQS), the summarizer (SQS) and the gateway (Bedrock) then assume IAM roles without stored keys, just like IRSA on EKS. Until then, the home cluster uses narrowly scoped IAM user keys kept in Secrets Manager.
 - **Terraform for both sides, in one repo (`wp-infra`):** shared modules, plus separate root modules for russetleaf.com's always-on edge, its demo stack (including Karpenter and its NodePools), and the russetleaf.dev home lab (Talos provider `siderolabs/talos` for both nodes' machine configs, Cloudflare provider for the tunnel, DNS and WAF rules, and the AWS pieces used from home).
 - **CI on GitHub in every repo:** Terraform checks and plans in `wp-infra`; manifest validation and Kyverno policy tests in `wp-gitops`; image builds with SBOMs, scans and signing in `wp-image` and `llm-summarizer`; and the prompt evaluation gate in `llm-summarizer`. Employers see all of it without the AWS stack running.
+- **Environments and promotion:** local, ci (kind + LocalStack + mock LLM per pull request), on-demand scale-to-zero staging with scrubbed production data, and automated promotion to production after staging passes.
 - **Operational alerting:** alerts as code with tests and runbooks, routed to Slack by site and severity, with inhibition rules, a dead man's switch, external uptime checks and silences during demo teardown.
 - **Documentation:** architecture diagrams for both environments, the cost breakdown, Grafana dashboard screenshots, Slack alert screenshots, runbooks, sample evaluation reports comparing models, and demo recordings.
 
@@ -645,9 +699,12 @@ wp-gitops/
   bootstrap/
     home/                   # root "app of apps" Application for the home cluster
     aws/                    # root "app of apps" Application for EKS
-  apps/                     # the applications, each with base + overlays/home, overlays/aws
+  apps/                     # the applications, each with base + overlays/home (prod), overlays/home-staging,
+                            #   overlays/aws, overlays/ci
     wordpress/              # values for the wp-image Helm chart (version pinned), analysis templates
                             #   (home: Prometheus/ingress-nginx; aws: CloudWatch/ALB)
+    staging-data/           # Job: load the latest prod backup into staging MariaDB and scrub personal data
+    smoke-tests/            # Job: staging smoke tests (pages, uploads, summary end to end)
     post-summarizer/        # values for the llm-summarizer Helm chart (chart version pinned), per environment:
                             #   queue URL, gateway URL, scaling limits, IAM role
     seed-from-dev/          # one-off Job: load the latest russetleaf.dev backup + media into russetleaf.com
@@ -676,9 +733,12 @@ wp-gitops/
     llm-gateway/            # LiteLLM + routing config: model list, fallbacks, canary weights, budgets
     llm-serving/            # llama.cpp model server, tolerations/node selector;
                             #   home: CPU build on box 2, aws: CUDA build on the GPU NodePool
-    actions-runner-controller/  # ARC + ephemeral self-hosted GitHub Actions runners
+    actions-runner-controller/  # ARC + ephemeral self-hosted GitHub Actions runners (for llm-summarizer's
+                            #   evaluation gate and wp-gitops' staging-test workflow)
   .github/workflows/        # render every overlay (Helm/Kustomize), validate against Kubernetes schemas
-                            #   (kubeconform), run Kyverno CLI policy tests
+                            #   (kubeconform), run Kyverno CLI policy tests, promtool tests; install changed
+                            #   platform components into kind; staging-test (on ARC runners); promote-to-prod
+  .mise.toml                # pinned CLI tool versions (same versions locally and in CI)
 ```
 
 - **App of apps:** each cluster gets one root Argo CD Application (`bootstrap/home` or `bootstrap/aws`) that points at the overlays for that environment. Argo CD then creates an Application for every app and platform service.
@@ -714,9 +774,10 @@ wp-infra/
     home/                   # russetleaf.dev: Talos machine configs (box 1 control plane; box 2 LLM worker with
                             #   label and taint), Cloudflare tunnel/DNS/WAF, plus the shared modules
                             #   (media, database-backup and model mirror buckets, SQS, Secrets Manager,
-                            #   SES identity, Bedrock IAM)
-  .github/workflows/        # fmt, validate, tflint, Checkov and plan on every pull request (plan posted as a
-                            #   comment); apply on merge to main, with a manual approval step
+                            #   SES identity, Bedrock IAM), plus a second, smaller set of the same modules
+                            #   for staging (Env=staging)
+  .github/workflows/        # fmt, validate, tflint, Checkov, `terraform test` (modules) and plan on every pull
+                            #   request (plan posted as a comment); apply on merge to main, with approval
 ```
 
 - **State:** all three environments store state in the S3 bucket from `bootstrap/`, under separate keys, using Terraform's built-in S3 state locking (`use_lockfile = true`, Terraform 1.10+; no DynamoDB table needed).
@@ -736,8 +797,10 @@ wp-image/
   mu-plugins/
     summary-queue/          # sends post IDs to SQS when a post is published or updated
   tests/                    # smoke test: the container starts, plugins are active, health check passes
-  .github/workflows/        # build, SBOM (Syft), scan (Trivy), sign (cosign), push image + chart to GHCR,
-                            #   open a version-bump pull request on wp-gitops
+  ci/                       # kind config, ci chart values (LocalStack, test credentials), integration tests
+  compose.yaml              # local environment: WordPress + MariaDB + Valkey + LocalStack
+  .github/workflows/        # build, SBOM (Syft), scan (Trivy), sign (cosign), kind integration tests, push image
+                            #   + chart to GHCR, open a version-bump pull request on wp-gitops (staging overlay)
 ```
 
 ### `llm-summarizer`: the standalone MLOps project
@@ -756,9 +819,11 @@ llm-summarizer/
                             #   PrometheusRule alerts, Grafana dashboard ConfigMap
   docker/                   # Dockerfile
   demo/                     # docker compose: sample posts + local model or Bedrock, no Kubernetes needed
+  ci/                       # kind config, ci chart values (LocalStack SQS, mock LLM), end-to-end tests
   MODEL_CARD.md             # models evaluated, scores, cost per summary, known limitations
-  .github/workflows/        # unit tests; evaluation gate (on ARC runners); on release: gate again, build image
-                            #   and chart, SBOM, scan, sign, publish, open a chart-bump pull request on wp-gitops
+  .github/workflows/        # unit tests; kind end-to-end tests (mock LLM); evaluation gate (on ARC runners);
+                            #   on release: gate again, build image and chart, SBOM, scan, sign, publish,
+                            #   open a chart-bump pull request on wp-gitops (staging overlay)
 ```
 
 Design choices that make it stand on its own:
@@ -784,13 +849,14 @@ Design choices that make it stand on its own:
 The self-hosted model isn't a special case: its deployment is ordinary platform config in `wp-gitops`, on a dedicated node defined in `wp-infra`, and its quality is judged in `llm-summarizer` alongside the Bedrock models.
 
 ### Release and promotion flow
-1. A change is merged in `wp-image` or `llm-summarizer` (for `llm-summarizer`, a release tag such as `v1.4.0`, after the evaluation gate passes).
+1. A change is merged in `wp-image` or `llm-summarizer` after its unit tests and **ci** kind-cluster tests pass (for `llm-summarizer`, a release tag such as `v1.4.0`, after the evaluation gate passes).
 2. CI builds the image (and chart), generates the SBOM, scans it, signs it with cosign, and pushes it to the registry.
-3. CI opens a pull request on `wp-gitops` that changes only the version: the image tag in `apps/wordpress/`, or the chart version in `apps/post-summarizer/`. The pull request links to the release notes and, for the summarizer, the evaluation report.
-4. `wp-gitops` CI renders the manifests and runs the Kyverno policy tests. You review and merge.
-5. Argo CD syncs the home cluster. Argo Rollouts runs the canary and rolls back automatically if the Prometheus checks fail. The AWS overlay uses the same versions, so the next AWS demo deploys exactly what's running at home.
+3. The bot opens a pull request on `wp-gitops` that changes only the version in **`overlays/home-staging`**, linking the release notes (and, for the summarizer, the evaluation report). It merges automatically once `wp-gitops` CI (rendering, schema checks, Kyverno policy tests) passes.
+4. The `staging-test` workflow creates staging, loads scrubbed data, runs the smoke tests and a short soak, then deletes staging again (see [Environments and promotion](#environments-and-promotion)).
+5. If staging passed, the bot opens a pull request bumping the version in **`overlays/home`** and **`overlays/aws`**, with the staging results attached. You review and merge.
+6. Argo CD syncs the home cluster. Argo Rollouts runs the canary and rolls back automatically if its checks fail. The AWS overlay uses the same versions, so the next AWS demo deploys exactly what's running at home.
 
-**Bot identity:** use a **GitHub App** (preferred) or a fine-grained personal access token that can only open pull requests on `wp-gitops`, stored as a secret in `wp-image` and `llm-summarizer`. Argo CD Image Updater is an alternative, but bot pull requests keep every deploy reviewable.
+**Bot identity:** use a **GitHub App** (preferred) or a fine-grained personal access token that can only open (and, for staging bumps, auto-merge) pull requests on `wp-gitops`, stored as a secret in `wp-image` and `llm-summarizer`. Argo CD Image Updater is an alternative, but bot pull requests keep every deploy reviewable.
 
 ### Who can do what
 
@@ -800,6 +866,7 @@ The self-hosted model isn't a special case: its deployment is ordinary platform 
 | `wp-image` CI | Push to the image registry; cosign keyless signing (GitHub OIDC); pull requests on `wp-gitops` via the bot |
 | `llm-summarizer` CI | Push images and charts; cosign keyless signing; pull requests on `wp-gitops` via the bot; evaluation runs on in-cluster ARC runners, which call Bedrock through the gateway |
 | Argo CD (both clusters) | Read `wp-gitops` and pull charts and images (public repos and registries need no credentials) |
+| `staging-test` workflow (ARC runners) | An Argo CD account limited to the staging project (sync and delete staging Applications only); posts to `#rl-staging` |
 | Kyverno | Admits only images signed by the `wp-image` and `llm-summarizer` release workflows (cosign keyless: GitHub OIDC issuer `https://token.actions.githubusercontent.com`, subject matching each repo's release workflow on `main` or a tag) |
 
 ### Making a change that spans repos

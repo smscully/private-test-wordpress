@@ -10,7 +10,8 @@ Each step is sized for one or a few Claude sessions, and ends with a **test** th
 - **One step at a time.** Build it, run the step's test, fix, commit. Don't start the next step until the test passes.
 - **Keep the plan current.** Tick the [progress checklist](#progress-checklist) and add to the [decision log](#decision-log) whenever something is decided or differs from `aws-wp.md`. Ask Claude to update this file at the end of each session.
 - **Watch box 1's memory.** After every step that adds something to the cluster, run `kubectl top nodes` and note the result in the checklist. Box 1 has 8 GB and the full design uses about 6–7 GB of it.
-- **Build the home overlay only, but keep the base clean.** Put anything environment-specific (domain, hostnames, endpoints, credentials) in `overlays/home`, never in `base`, so `overlays/aws` can be added later without rework.
+- **Build the home overlays only, but keep the base clean.** Put anything environment-specific (domain, hostnames, endpoints, credentials) in `overlays/home` (prod), `overlays/home-staging` or `overlays/ci`, never in `base`, so `overlays/aws` can be added later without rework.
+- **Use the environments.** Try changes **locally** first (Docker Compose or a local kind/Talos cluster); once step 5.4 exists, every pull request is tested in a **ci** kind cluster; once step 5.6 exists, new versions go through **staging** before production. See [Environments and promotion](aws-wp.md#environments-and-promotion).
 - **Never commit secrets.** Secrets go in AWS Secrets Manager and reach the cluster through External Secrets. Terraform state (which can contain secrets) lives in an encrypted S3 bucket. kubeconfig and talosconfig files stay outside Git.
 
 ## Starting point (as of 2026-10-31)
@@ -21,19 +22,118 @@ Each step is sized for one or a few Claude sessions, and ends with a **test** th
 - russetleaf.dev is a Cloudflare zone.
 - Box 2 (Intel i3, 8 GB) is available to become the LLM worker node.
 
+## Local workstation setup (Ubuntu 24.04)
+
+Everything is built and tested from your Ubuntu 24.04 machine, which is also the **local** environment (see [Environments and promotion](aws-wp.md#environments-and-promotion)). Do this before step 0.1's test.
+
+**Hardware:** 16 GB of RAM or more is recommended; a local kind or Talos-in-Docker cluster plus LocalStack and WordPress use about 4–6 GB. At least 40 GB of free disk for container images.
+
+### 1. Base packages
+
+```bash
+sudo apt update
+sudo apt install -y git curl wget unzip jq make ca-certificates gnupg lsb-release \
+  python3 python3-venv shellcheck direnv
+```
+
+### 2. Docker Engine (from Docker's own repository, not the snap)
+
+```bash
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker "$USER"     # then log out and back in
+```
+
+**kind needs higher file-watch limits** on Ubuntu (otherwise pods fail with "too many open files"):
+
+```bash
+echo -e "fs.inotify.max_user_watches=524288\nfs.inotify.max_user_instances=512" \
+  | sudo tee /etc/sysctl.d/99-kind.conf
+sudo sysctl --system
+```
+
+### 3. CLI tools, pinned per repo with mise
+
+Use **mise** to install the command-line tools, with the versions pinned in a `.mise.toml` file in each repo. The same file is used by CI (the `jdx/mise-action` GitHub Action), so your machine and CI always run the same versions, and Renovate can keep them updated.
+
+```bash
+curl https://mise.run | sh
+echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Tools to pin (check each name with `mise registry | grep <tool>`; pin `kubectl` and `talosctl` to your cluster's versions):
+
+| Tool | Used for |
+|---|---|
+| `terraform` (1.10+), `tflint` | Infrastructure (`wp-infra`) |
+| `talosctl` | Talos clusters (home and local Talos-in-Docker) |
+| `kubectl`, `helm`, `kustomize` | Kubernetes and charts |
+| `kind` | Local and ci test clusters |
+| `argocd` | Argo CD CLI (staging workflow, debugging) |
+| `k9s`, `stern`, `kubectx` | Day-to-day cluster work (optional but very useful) |
+| `kubeconform`, `chart-testing` (`ct`) | Manifest and chart validation |
+| `kyverno` | Policy tests |
+| `cosign`, `syft`, `trivy` | Image signing, SBOMs, scanning |
+| `gh` | GitHub CLI |
+| `awscli` (v2) | AWS |
+| `uv` | Python tooling (the summarizer, Checkov, pre-commit, LocalStack CLI) |
+| `promtool` (from Prometheus) | Testing alert rules |
+
+Python-based tools, installed with uv:
+
+```bash
+uv tool install pre-commit
+uv tool install checkov
+uv tool install localstack      # optional: LocalStack CLI (LocalStack itself runs in Docker)
+```
+
+PHP and Composer aren't needed locally: the WordPress image installs plugins inside its Docker build.
+
+### 4. Configuration
+
+- **Git:** set your name and email; authenticate with `gh auth login` (SSH); turn on **commit signing** with your SSH key (`git config --global gpg.format ssh` and `user.signingkey`), and upload the key to GitHub as a signing key.
+- **AWS:** set up **IAM Identity Center (SSO)** and a profile (e.g. `russetleaf-admin`) with `aws configure sso`; sign in with `aws sso login --profile russetleaf-admin`. Keep **no long-lived AWS access keys** on the workstation.
+- **Cloudflare and Slack tokens:** don't put them in `~/.bashrc`. Use per-repo **direnv** files (`.envrc`, listed in `.gitignore`) that load them from a password manager CLI or from AWS Secrets Manager when you enter the repo folder.
+- **Cluster access files:** keep kubeconfig contexts named clearly (`talos-home`, `kind-ci`, `talos-local`) and talosconfig at `~/.talos/config`, both with `chmod 600`. Back them up in your password manager. (If they're lost, they can be regenerated from the Talos machine secrets in Terraform state.)
+- **Pre-commit hooks:** run `pre-commit install` in each repo after cloning (secret scan, Terraform formatting, YAML checks).
+- **Editor (optional):** VS Code with the HashiCorp Terraform, YAML (Red Hat), Kubernetes and Docker extensions.
+
+### 5. Check the setup
+
+Add a `scripts/check-tools.sh` to `wp-gitops` that prints every tool's version and fails if one is missing. Then:
+
+```bash
+docker run --rm hello-world
+kind create cluster --name smoke && kubectl get nodes && kind delete cluster --name smoke
+talosctl cluster create --name local-smoke          # Talos in Docker
+talosctl cluster destroy --name local-smoke
+aws sts get-caller-identity --profile russetleaf-admin
+gh auth status
+```
+
+**Test:** all of the above succeed, and `scripts/check-tools.sh` reports every tool.
+
 ## Phase 0: Prerequisites and decisions
 
 ### Step 0.1: Accounts, tools and budget alert
 **Do:**
 - Accounts: AWS (with MFA on the root user and an admin IAM user or SSO for daily work), GitHub, Cloudflare (russetleaf.dev zone).
-- Install locally: `terraform` (1.10+), `talosctl` (matching your Talos version), `kubectl`, `helm`, `kustomize`, `aws` CLI v2, `gh`, `cosign`, `kyverno` CLI, `kubeconform`, `docker`.
+- Set up the workstation: see [Local workstation setup](#local-workstation-setup-ubuntu-2404).
 - Create an **AWS Budget** with an email alert at about $25/month (by hand in the console is fine; Terraform takes over in step 2.1).
 - Pick an AWS region for the home lab's AWS resources (e.g. `us-east-1`) and use it everywhere.
 
-- **Slack:** create the project workspace and the channels from `aws-wp.md` ([Alerting and notifications](aws-wp.md#alerting-and-notifications-slack)): `#rl-critical`, `#rl-dev-alerts`, `#rl-com-alerts`, `#rl-deploys`, `#rl-security`, `#rl-mlops`, `#rl-costs`. Create the custom Slack app ("russetleaf-bot") with a bot token allowed to post to those channels, and install the **GitHub** app for Slack. Turn on phone notifications for `#rl-critical` only.
+- **Slack:** create the project workspace and the channels from `aws-wp.md` ([Alerting and notifications](aws-wp.md#alerting-and-notifications-slack)): `#rl-critical`, `#rl-dev-alerts`, `#rl-com-alerts`, `#rl-deploys`, `#rl-security`, `#rl-mlops`, `#rl-costs`, `#rl-staging`. Create the custom Slack app ("russetleaf-bot") with a bot token allowed to post to those channels, and install the **GitHub** app for Slack. Turn on phone notifications for `#rl-critical` only.
 - **Outside monitoring accounts** (free plans): a heartbeat service (e.g. healthchecks.io) and an uptime checker (e.g. UptimeRobot or Better Stack), both posting to Slack.
 
-**Test:** `aws sts get-caller-identity` works; every tool prints its version; a test message from the bot token (`curl` to Slack's `chat.postMessage`) appears in `#rl-dev-alerts`.
+**Test:** the workstation checks pass; a test message from the bot token (`curl` to Slack's `chat.postMessage`) appears in `#rl-dev-alerts`.
 
 ### Step 0.2: Decisions to make before writing code
 Record each answer in the [decision log](#decision-log).
@@ -47,7 +147,9 @@ Record each answer in the [decision log](#decision-log).
 | **Existing Talos node** | **Rebuild it with Terraform** in step 2.2, rather than adopting the hand-built config. | Nothing on the cluster is worth keeping, and a Terraform-built cluster is reproducible. Adopting it means importing its existing machine secrets, which is fiddly. |
 | **Bot for version-bump pull requests** | A **GitHub App** installed only on `wp-gitops`. | Narrower and longer-lived than a personal access token. |
 | **Network policies (CNI)** | Decide **now**: either keep Talos's default **Flannel** (simpler, but it does **not** enforce Kubernetes NetworkPolicies), or install **Cilium** as the CNI (Talos config `cni: none`, then Cilium), which enforces them. Cilium is recommended if you want step 6.3. | Changing the CNI later means rebuilding the cluster. Without enforced NetworkPolicies, any pod can reach any other pod (e.g. the database). |
-| **Resource tagging** | Every AWS resource gets `Project=russetleaf`, `Site=dev`, `ManagedBy=terraform`, set as the AWS provider's `default_tags`. | Lets you find leftovers and see costs per site in Cost Explorer. The AWS plan uses the same scheme with `Site=com`. |
+| **Staging** | **On-demand, scale-to-zero** staging on the home cluster (created for each promotion, deleted afterwards). Promotion with plain **GitHub Actions** workflows; consider **Kargo** later only if memory allows. | Box 1 has no memory to spare for an always-on staging copy. |
+| **AWS stand-ins for ci tests** | **LocalStack** (S3, SQS, Secrets Manager), if its current free-tier terms suit; otherwise **MinIO** (S3) + **ElasticMQ** (SQS) + plain Kubernetes Secrets. | ci tests must run without an AWS account. |
+| **Resource tagging** | Every AWS resource gets `Project=russetleaf`, `Site=dev`, `Env=prod|staging`, `ManagedBy=terraform`, set as the AWS provider's `default_tags`. | Lets you find leftovers and see costs per site in Cost Explorer. The AWS plan uses the same scheme with `Site=com`. |
 
 ## Phase 1: Repositories
 
@@ -86,9 +188,10 @@ Record each answer in the [decision log](#decision-log).
 **Do** (`wp-infra/modules/` + `envs/home/`):
 - Modules: `s3-media`, `s3-backups`, `sqs-queue` (with dead-letter queue), `secrets`, `bedrock-access`.
 - russetleaf.dev resources: media bucket, database-backup bucket (lifecycle: expire after 30 days), **model mirror bucket** (for the self-hosted model's file, used in step 8.1), summary queue + dead-letter queue, Secrets Manager entries (empty placeholders; values set by hand or generated), Bedrock budget alert.
+- **Staging resources** (a second, smaller set of the same modules, tagged `Env=staging`): staging media bucket, summary queue + dead-letter queue, Secrets Manager entries, and a scoped IAM key that can **read** the production backup bucket but write only to staging resources. Used from step 5.6.
 - **Email:** an SES domain identity for russetleaf.dev, with its DKIM and SPF records created in Cloudflare, and SES SMTP credentials stored in Secrets Manager. (New SES accounts are in the "sandbox" and can only send to verified addresses; verify your own address for testing, or request production access.)
 - Scoped IAM users and keys for the home cluster, one per job: External Secrets (read the russetleaf.dev secrets only), WordPress (media bucket + send to queue), MariaDB backups (backup bucket), summarizer (read from queue), LiteLLM (`bedrock:InvokeModel` on the chosen models only). Store each key in Secrets Manager.
-- Cloudflare (Cloudflare provider): the tunnel, its token (stored in Secrets Manager), DNS records for `russetleaf.dev` and `www`, basic WAF/security settings, **Cloudflare Access** policies for admin UIs (Argo CD, Grafana) so they're never public, and **Cloudflare notifications** (tunnel health, security events) to a Slack webhook for `#rl-dev-alerts`.
+- Cloudflare (Cloudflare provider): the tunnel, its token (stored in Secrets Manager), DNS records for `russetleaf.dev` and `www`, basic WAF/security settings, **Cloudflare Access** policies for admin UIs (Argo CD, Grafana) so they're never public, **Cloudflare notifications** (tunnel health, security events) to a Slack webhook for `#rl-dev-alerts`, and a `staging.russetleaf.dev` hostname behind Cloudflare Access (used from step 5.6).
 - The Slack bot token in Secrets Manager (set by hand; Terraform creates the empty entry).
 - Bedrock: confirm access to Claude Haiku and Amazon Nova Lite in the chosen region (Anthropic models may need a one-time use-case form in the console).
 
@@ -138,7 +241,7 @@ Check `kubectl top nodes` after each step.
 ### Step 4.4: Monitoring
 **Do:** `platform/monitoring/`: kube-prometheus-stack, trimmed for 8 GB: 7-day retention, 30–60 s scrape interval, resource limits on every part. Grafana behind Cloudflare Access. Then the alerting setup from `aws-wp.md`:
 - Prometheus external labels `site=dev`, `cluster=talos-home`.
-- **Alertmanager → Slack** with the bot token from External Secrets: criticals to `#rl-critical` and `#rl-dev-alerts`; warnings to `#rl-dev-alerts`; `team=security|mlops|cost` alerts to their channels; grouping and repeat intervals; **inhibition rules** (site down suppresses its downstream alerts).
+- **Alertmanager → Slack** with the bot token from External Secrets: criticals to `#rl-critical` and `#rl-dev-alerts`; warnings to `#rl-dev-alerts`; `team=security|mlops|cost` alerts to their channels; `env=staging` alerts to `#rl-staging` only; grouping and repeat intervals; **inhibition rules** (site down suppresses its downstream alerts).
 - **Dead man's switch:** route the always-firing `Watchdog` alert to the heartbeat service's URL; the heartbeat service alerts `#rl-critical` if pings stop.
 - **External uptime check** for `https://russetleaf.dev` (and, once the AWS edge exists, russetleaf.com expecting 200 or the 503 offline page).
 - **Alerts as code:** a starter set of `PrometheusRule`s (site down, pod crash-looping, node memory high, disk filling, certificate/tunnel down), each with `severity`, `summary`, `description` and `runbook_url`; a runbook for each in `docs/runbooks/`; `promtool test rules` in `wp-gitops` CI.
@@ -175,9 +278,43 @@ Check `kubectl top nodes` after each step.
 **Test:** `https://russetleaf.dev` serves WordPress; an uploaded image lands in the S3 bucket and displays; the Redis Object Cache plugin shows "connected"; killing the WordPress pod loses nothing; WP-Cron jobs run from the CronJob; a password-reset email arrives through SES.
 
 ### Step 5.3: Image promotion
-**Do:** create the GitHub App; the `wp-image` release workflow opens a pull request on `wp-gitops` that changes only the chart and image version in `apps/wordpress/`, linking the release notes.
+**Do:** create the GitHub App; the `wp-image` release workflow opens a pull request on `wp-gitops` that changes only the chart and image version in `apps/wordpress/overlays/home`, linking the release notes. (Step 5.7 later points this at staging first.)
 
 **Test:** merge a trivial change in `wp-image` → a signed image is pushed → a bump pull request appears in `wp-gitops` → merging it rolls out the new image, and the rollout appears in `#rl-deploys`. Subscribe `#rl-deploys` to the four repos' releases and merged pull requests with the GitHub Slack app.
+
+### Step 5.4: ci test clusters (kind + AWS stand-ins)
+**Do:**
+- `wp-image/ci/`: a kind cluster config and `ci` chart values (LocalStack, or MinIO + ElasticMQ, per step 0.2; a MariaDB and Valkey installed into the kind cluster; test credentials).
+- Integration tests (e.g. a shell or Python test script run after `helm install`): the site installs and loads; an upload lands in the stand-in S3 bucket; publishing a post sends a message to the stand-in SQS queue.
+- A pull request workflow on **GitHub-hosted** runners: create the kind cluster (`helm/kind-action`), load the freshly built image, install the chart with `ct install` or `helm install`, run the tests, collect logs on failure.
+- `compose.yaml` for the **local** environment: WordPress + MariaDB + Valkey + LocalStack, so the same checks can be run by hand.
+- In `wp-gitops` CI: install changed **platform** components into a kind cluster to check they start (where they can run without the real cluster's dependencies).
+
+**Test:** a pull request in `wp-image` runs the kind tests and passes; a deliberately broken change (e.g. a wrong S3 setting) fails them; `docker compose up` gives a working local site.
+
+### Step 5.5: Self-hosted runners (ARC)
+**Do:** `platform/actions-runner-controller/`: ARC with **ephemeral** runners, tolerating box 2's taint so they run off box 1. Start with a runner scale set for **`wp-gitops`** (used by the staging workflow); `llm-summarizer` gets its own in step 9.2. Before any repo goes public: require approval for workflows from fork pull requests, and limit which workflows can use the self-hosted label.
+
+**Test:** a test workflow in `wp-gitops` runs on a self-hosted runner pod, which is deleted afterwards; a fork pull request waits for approval.
+
+### Step 5.6: On-demand staging
+**Do:**
+- `overlays/home-staging` for WordPress (1 replica, `staging.russetleaf.dev`, no Valkey), a small staging **MariaDB** (MariaDB Operator), and the staging AWS resources and secrets from step 2.3. Label everything `env=staging`.
+- Staging Argo CD Applications in their own **Argo CD project**, with **auto-sync off**, so nothing runs until a test starts.
+- `apps/staging-data/`: a Job that downloads the latest russetleaf.dev production backup from S3, imports it into the staging MariaDB, and **scrubs personal data** (user emails replaced with `user<ID>@example.invalid`, commenter names/emails/IPs cleared, application passwords and sessions deleted), then runs `wp search-replace 'russetleaf.dev' 'staging.russetleaf.dev'`.
+- `apps/smoke-tests/`: a Job that checks the home page and sample posts load, an upload goes to the staging bucket, and a published post gets a summary (once Phase 7 exists; skip that check until then).
+- An Argo CD account with RBAC limited to the staging project (sync and delete only); its token in Secrets Manager.
+- The **`staging-test`** workflow (on the ARC runners): sync staging → wait for healthy → run `staging-data` → run `smoke-tests` → soak ~30 minutes checking Prometheus for errors and restarts → record results → **delete** the staging Applications with cascade (volumes included) → post results to `#rl-staging`.
+
+**Test:** run `staging-test` by hand: staging comes up at `staging.russetleaf.dev` (behind Cloudflare Access), shows production posts with **no real email addresses** in the database, passes the smoke tests, and is fully removed afterwards (`kubectl get all,pvc -n <staging namespaces>` is empty). Record box 1's peak memory during the run in the checklist.
+
+### Step 5.7: Promotion pipeline (staging → prod)
+**Do:**
+- Change the `wp-image` release bot (step 5.3) to bump **`overlays/home-staging`** instead of prod, with **auto-merge** once `wp-gitops` CI passes.
+- Trigger `staging-test` on pushes to `main` that change a staging version.
+- On a pass, a **`promote-to-prod`** job opens a pull request bumping the same version in `overlays/home` (and `overlays/aws` once it exists), with the staging results attached. On a failure, post to `#rl-staging` and `#rl-deploys` and promote nothing.
+
+**Test:** release a trivial `wp-image` change → it auto-merges to staging → `staging-test` passes → a promotion pull request appears with results → merging it rolls out to russetleaf.dev. Release a deliberately broken version → staging fails → no promotion pull request, and `#rl-staging` shows why.
 
 ## Phase 6: Policy and progressive delivery
 
@@ -213,7 +350,7 @@ Review the policy reports, fix violations, then switch to **enforce**.
 **Test:** a test `ScaledObject` scales a dummy Deployment from 0 to 1 when a message is sent to a test queue, and back to 0 when the queue is empty.
 
 ### Step 7.2: LiteLLM gateway
-**Do:** `platform/llm-gateway/`: LiteLLM with Claude Haiku (default) and Amazon Nova Lite on Bedrock, using the scoped Bedrock key; per-app budgets and rate limits; metrics exposed to Prometheus; an internal API key for callers.
+**Do:** `platform/llm-gateway/`: LiteLLM with Claude Haiku (default) and Amazon Nova Lite on Bedrock, using the scoped Bedrock key; per-app budgets and rate limits (a separate key and small budget for staging); metrics exposed to Prometheus; an internal API key for callers.
 
 **Test:** from a test pod, an OpenAI-style chat request to the gateway returns answers from both models; requests over the rate limit are refused; the gateway's metrics appear in Prometheus.
 
@@ -229,10 +366,12 @@ Review the policy reports, fix violations, then switch to **enforce**.
 ### Step 7.4: Summarizer chart, release and deployment
 **Do:**
 - `chart/`: Deployment (Rollout later), KEDA `ScaledObject` on the SQS queue (0–N), daily sweep CronJob, ServiceAccount, resources.
-- Release workflow: build, SBOM, scan, sign, push the image and the chart (OCI) to GHCR, open a chart-bump pull request on `wp-gitops`.
-- `wp-gitops/apps/post-summarizer/overlays/home`: queue URL, gateway URL, WordPress URL, credentials from External Secrets.
+- `ci/`: kind end-to-end tests on GitHub-hosted runners, with the AWS stand-ins (SQS) and a **mock LLM** (LiteLLM with mock responses): a queued post gets a summary written back to a test WordPress; a failing message reaches the dead-letter queue.
+- Release workflow: build, SBOM, scan, sign, push the image and the chart (OCI) to GHCR, open a chart-bump pull request on `wp-gitops` for **`overlays/home-staging`** (promoted to prod by the step 5.7 pipeline).
+- `wp-gitops/apps/post-summarizer/overlays/home` and `overlays/home-staging`: queue URL, gateway URL (staging uses its own LiteLLM key and budget), WordPress URL, credentials from External Secrets.
+- Turn on the summarizer check in the staging smoke tests (step 5.6).
 
-**Test (end to end):** publish a post on russetleaf.dev → a summarizer pod starts → the summary appears on the post within a few minutes → the pod scales back to zero. A message that always fails ends up in the dead-letter queue.
+**Test (end to end):** the kind tests pass in CI; a release goes through staging and is promoted; then publish a post on russetleaf.dev → a summarizer pod starts → the summary appears on the post within a few minutes → the pod scales back to zero. A message that always fails ends up in the dead-letter queue.
 
 ### Step 7.5: LLM monitoring
 **Do:** OpenTelemetry metrics in the summarizer (tokens, latency, errors, fallbacks, estimated cost, all labelled by model and prompt version); the Grafana LLM dashboard and `PrometheusRule` alerts shipped **in the summarizer chart** (error spike, dead-letter queue not empty, daily Bedrock spend over a limit, all labelled `team=mlops` so they go to `#rl-mlops`, with runbooks); SQS queue depth in Grafana.
@@ -258,15 +397,15 @@ Review the policy reports, fix violations, then switch to **enforce**.
 
 **Test:** running the script locally against the gateway (via `kubectl port-forward`) produces a report comparing Haiku, Nova Lite and the local model.
 
-### Step 9.2: Self-hosted runners (ARC)
-**Do:** `platform/actions-runner-controller/`: ARC with **ephemeral** runners registered to `llm-summarizer`, tolerating box 2's taint so they run beside the model and off box 1. Before the repo goes public: require approval for workflows from fork pull requests, and limit which workflows can use the self-hosted label.
+### Step 9.2: Runners for `llm-summarizer`
+**Do:** add a second ARC runner scale set (step 5.5) registered to **`llm-summarizer`**, on box 2 next to the model, with the same protections (approval for fork pull requests, self-hosted label limited to the evaluation workflows).
 
 **Test:** a test workflow runs on a self-hosted runner pod, which is deleted afterwards; a fork pull request waits for approval.
 
 ### Step 9.3: Evaluation gate and releases
 **Do:**
 - Pull request workflow (on ARC runners): run the evaluation, post per-model scores as a pull request comment compared with `main`, fail below the threshold.
-- Release workflow: run the gate again, then publish (step 7.4), attach the report to the GitHub release, update `MODEL_CARD.md`.
+- Release workflow: run the gate again, then publish (step 7.4, into staging first), attach the report to the GitHub release, update `MODEL_CARD.md`.
 - Post gate results (pass/fail, per-model scores, link to the report) to `#rl-mlops`.
 - Optionally convert the summarizer to an Argo Rollouts canary.
 
@@ -312,6 +451,8 @@ These keep russetleaf.dev healthy once it's running. Add each as a calendar remi
 | Talos and Kubernetes upgrades | When new versions are out (Talos releases roughly every few months) | Bump versions in `wp-infra/envs/home` and apply; upgrade box 2 first, then box 1 |
 | Back up cluster state (etcd) | Weekly | `talosctl etcd snapshot` to the backup bucket (a scheduled job on your machine or a CronJob using a Talos API key). GitOps can rebuild everything else, but this speeds up recovery. |
 | Check for Terraform drift | Weekly | A scheduled `terraform plan` in `wp-infra` CI for the AWS and Cloudflare resources (alerts if anything changed outside Terraform) |
+| Check staging still works | Monthly, if nothing has been promoted | Run `staging-test` by hand, so a broken staging setup is found before it blocks a real release |
+| Check the staging scrub | After any plugin that stores personal data is added | Confirm the `staging-data` Job also clears that plugin's tables |
 | Rotate scoped IAM keys | Every 90 days, until step 11.1 removes them | Create a new key in Terraform, update Secrets Manager, let External Secrets sync it, delete the old key |
 | Review alerts, costs and Bedrock spend | Monthly | Grafana, OpenCost, the AWS Budget and Cost Explorer (filter by `Site=dev`) |
 | Review alert noise | Monthly | Look at what fired in the Slack channels: remove or tune alerts nobody acted on, and update runbooks that didn't help |
@@ -349,6 +490,10 @@ The home lab already builds most of what these need: the shared Terraform module
 | 5.1 WordPress image | ☐ | | | |
 | 5.2 WordPress deployment | ☐ | | | |
 | 5.3 Image promotion | ☐ | | | |
+| 5.4 ci test clusters | ☐ | | | |
+| 5.5 Self-hosted runners (ARC) | ☐ | | | |
+| 5.6 On-demand staging | ☐ | | | |
+| 5.7 Promotion pipeline | ☐ | | | |
 | 6.1 Kyverno | ☐ | | | |
 | 6.2 Argo Rollouts | ☐ | | | |
 | 6.3 Network policies (optional) | ☐ | | | |
@@ -360,7 +505,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 8.1 llama.cpp on box 2 | ☐ | | | |
 | 8.2 Gateway routing to local model | ☐ | | | |
 | 9.1 Evaluation set | ☐ | | | |
-| 9.2 ARC runners | ☐ | | | |
+| 9.2 Runners for `llm-summarizer` | ☐ | | | |
 | 9.3 Evaluation gate + releases | ☐ | | | |
 | 10.1 Falco | ☐ | | | |
 | 10.2 Trivy Operator + Talos notes | ☐ | | | |
