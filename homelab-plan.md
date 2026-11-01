@@ -159,7 +159,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. Planned ADRs include `0001-no-service-mesh.md` (step 6.4) and `0002-s3-media-not-efs.md` (step 5.1).
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and two ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4) and `0002-s3-media-not-efs.md` (finish in step 5.1); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
 - In `wp-gitops`: move `aws-wp.md` and this file to `docs/`, and write the hub README (what the project is, links to all four repos).
@@ -270,7 +270,7 @@ Check `kubectl top nodes` after each step.
   - **S3-Uploads** (Human Made, open source): uploads go **directly to S3**, so no writable uploads directory is needed. Preferred if it works with a custom S3 endpoint (for the ci stand-ins) and with CloudFront as the media URL.
   - **WP Offload Media Lite**: writes locally first, then copies to S3; needs a writable uploads `emptyDir`.
   - Check for both: upload, image resizing (thumbnails), deleting media, and the media URL pointing at the right place (S3 at home, CloudFront on AWS).
-- **Write `docs/adr/0002-s3-media-not-efs.md`** in `wp-gitops`: the EFS vs S3 comparison, the plugin chosen and why, and when EFS would be the better choice.
+- **Finish `docs/adr/0002-s3-media-not-efs.md`** (already drafted): fill in its open item with the plugin chosen and why, and whether the uploads `emptyDir` is needed.
 - **Built to pass the Kyverno policies from step 6.1:** Apache runs as **`www-data`** listening on **port 8080** (non-root can't use port 80), and the container works with a **read-only root filesystem** given writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions, and the uploads directory only if the chosen plugin needs it. Test both in the Compose smoke test.
 - `wp-config` settings read from environment variables (database, Valkey, S3, queue URL, `WP_HOME`/`WP_SITEURL`, `DISALLOW_FILE_MODS`, `DISABLE_WP_CRON`), with **TLS to the database** turned on.
 - A **`db.php` drop-in** whose behaviour is chosen by the chart setting **`database.auth`**. Build only the **`password`** mode now (reads the password from a Secret, connects over TLS); it's what the home lab uses, and it's the AWS fallback too. Leave a clear extension point for an **`iam`** mode, which is written **only after** the AWS plan's early test (step 1.6) shows that PHP can log in to RDS Proxy with an IAM token. That way no work is wasted if the test fails. Add the **RDS CA certificate bundle** to the image now (harmless at home, needed on AWS).
@@ -369,7 +369,7 @@ Review the policy reports, fix violations, then switch to **enforce**.
 
 ### Step 6.4: Service mesh decision (ADR) and optional Istio experiment
 **Do:**
-- Write `docs/adr/0001-no-service-mesh.md`: what a mesh like Istio would add, how Cilium (WireGuard, layer-7 policies, Hubble), Argo Rollouts and LiteLLM already cover it, the memory and complexity cost on 8 GB nodes, and **when you'd revisit** (many more services, a requirement to verify service identity on every connection, multi-cluster traffic). See [Service mesh (Istio): not used, by decision](aws-wp.md#service-mesh-istio-not-used-by-decision).
+- Finish `docs/adr/0001-no-service-mesh.md` (already drafted; review it and resolve its open items as they're done): what a mesh like Istio would add, how Cilium (WireGuard, layer-7 policies, Hubble), Argo Rollouts and LiteLLM already cover it, the memory and complexity cost on 8 GB nodes, and **when you'd revisit** (many more services, a requirement to verify service identity on every connection, multi-cluster traffic). See [Service mesh (Istio): not used, by decision](aws-wp.md#service-mesh-istio-not-used-by-decision).
 - **Optional experiment (local only):** in a kind cluster on your workstation running Cilium, install **Istio ambient mode** (following Istio's instructions for running alongside Cilium), deploy the WordPress chart with test values, and enable mTLS and one layer-7 authorization policy. Record memory use, setup issues and what it added in the ADR. Delete the cluster afterwards; nothing in either site depends on it.
 
 **Test:** the ADR is reviewed and linked from the hub README and the decision log; if the experiment was run, its findings are in the ADR.
