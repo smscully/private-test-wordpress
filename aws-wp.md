@@ -18,7 +18,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Path in | Route 53 → CloudFront (always on) → ALB + AWS WAF → EKS | Cloudflare (CDN, WAF, TLS) → Cloudflare Tunnel → cloudflared → ingress-nginx → Talos |
 | TLS certificates | ACM | Cloudflare |
 | Kubernetes | EKS, Karpenter general + GPU NodePools | Talos: box 1 (control plane) + box 2 (LLM worker) |
-| Database | RDS MySQL (Multi-AZ), restored from a snapshot each demo | MariaDB in-cluster (MariaDB Operator), backups to S3 |
+| Database | RDS for MariaDB (Multi-AZ), restored from a snapshot each demo | MariaDB in-cluster (MariaDB Operator), daily backups to S3 |
 | Object cache | ElastiCache Valkey | Valkey in-cluster |
 | Media | Its own S3 bucket (always on), served through CloudFront | Its own S3 bucket |
 | Summary queue | Its own SQS queue + dead-letter queue | Its own SQS queue + dead-letter queue |
@@ -29,7 +29,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | GitOps overlay (`wp-gitops`) | `overlays/aws` | `overlays/home` |
 | Monthly cost | ~$1 always on, plus ~$1/hour during demos | ~$7–$14 |
 
-Running MariaDB and Valkey inside the home cluster, instead of RDS and ElastiCache, is the biggest saving in the home lab: those two managed services alone would cost about $130/month at the AWS design's sizes.
+Running MariaDB and Valkey inside the home cluster, instead of RDS and ElastiCache, is the biggest saving in the home lab: those two managed services alone would cost about $130/month at the AWS design's sizes. Both sites use the **MariaDB** engine (in-cluster at home, RDS for MariaDB on AWS), so database backups move between them without conversion.
 
 ## Architecture overview
 
@@ -55,7 +55,7 @@ ALB + AWS WAF (TLS via ACM; accepts only CloudFront traffic)
 EKS: WordPress pods (stateless, 2–3+ replicas across AZs, Argo Rollouts canaries)
   │                │                  │  publish/update event          ▲
   ▼                ▼                  ▼                                │ REST API (save summary)
-RDS MySQL       ElastiCache Valkey   Amazon SQS ──► Post-summarizer pods (KEDA: 0–N)
+RDS MariaDB     ElastiCache Valkey   Amazon SQS ──► Post-summarizer pods (KEDA: 0–N)
 (Multi-AZ)      (object cache)                            │
                                                           ▼
                                               LiteLLM gateway (routing, fallback,
@@ -101,7 +101,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 ## What production-ready adds
 
 ### High availability
-- RDS (or Aurora) with **Multi-AZ** turned on.
+- **RDS for MariaDB** with **Multi-AZ** turned on. (Aurora doesn't offer MariaDB; if the site outgrew RDS, Aurora MySQL would be the next step, at the cost of switching engines.)
 - At least **2–3 WordPress replicas** spread across availability zones, plus a **HorizontalPodAutoscaler** and **PodDisruptionBudgets**.
 - EKS worker nodes in **multiple AZs**, provisioned by **Karpenter** (see Delivery and operations).
 
@@ -150,7 +150,8 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 - **Outgoing email through Amazon SES** with an SMTP plugin.
 
 ### Backup and recovery
-- Automated **RDS backups** with point-in-time recovery.
+- Automated **RDS backups** with point-in-time recovery, plus a **final snapshot** each time the russetleaf.com demo stack is destroyed.
+- Daily **logical backups** of the russetleaf.dev database to S3; see [russetleaf.dev database backups](#russetleafdev-database-backups).
 - **S3 versioning**, plus cross-region replication if you need disaster recovery.
 - A **restore you have actually tested**.
 
@@ -294,7 +295,7 @@ These are approximate prices for **us-east-1**, on demand unless noted, for a sm
 | EKS worker nodes (EC2) | Karpenter general pool, ~3 × t3.medium equivalent across AZs (spot can lower this), plus a small managed node group for Karpenter | ~$91–$120 |
 | EKS LLM nodes (GPU) | Karpenter GPU pool, 1 × g6.xlarge on spot (~$0.80/hr on demand, ~$590/month) | ~$200–$250 |
 | EBS for worker nodes | 3 × 20 GB + 1 × 100 GB gp3 (LLM node and model files) | ~$13 |
-| RDS MySQL | db.t4g.medium, Multi-AZ | ~$95 |
+| RDS for MariaDB | db.t4g.medium, Multi-AZ (same price as RDS for MySQL) | ~$95 |
 | RDS storage | 50 GB gp3, Multi-AZ | ~$12 |
 | ElastiCache Valkey | 2 × cache.t4g.small (primary + replica) | ~$37 |
 | Application Load Balancer | 1 ALB + light LCU usage | ~$22 |
@@ -356,7 +357,13 @@ This also works for any HTTP method (logins and form posts get the offline page 
 Each demo creates a new RDS instance, so content needs a plan:
 - **Final snapshot on destroy (recommended):** set `skip_final_snapshot = false` on the RDS instance, and have the next `terraform apply` restore from the most recent snapshot. Posts, summaries and settings carry over. Snapshot storage costs a few cents a month for a site this size.
 - **Media is never lost:** the russetleaf.com media bucket lives in `envs/aws-edge`, so uploads survive between demos.
-- **Optional: seed from russetleaf.dev.** For the first demo (or to refresh), restore the latest MariaDB backup of russetleaf.dev from S3 into RDS with a one-off Kubernetes Job, then run `wp search-replace 'russetleaf.dev' 'russetleaf.com'` and copy the media between buckets. After that, russetleaf.com shows the same posts as the live site.
+- **Optional: seed from russetleaf.dev.** For the first demo, or to refresh russetleaf.com with the live site's content, run the **seed Job** (`wp-gitops/apps/seed-from-dev/`, an Argo CD Application set to manual sync, AWS only). It:
+  1. downloads the latest daily backup of russetleaf.dev from its S3 backup bucket (see [russetleaf.dev database backups](#russetleafdev-database-backups))
+  2. imports it into RDS for MariaDB (same engine, so no conversion is needed)
+  3. runs `wp search-replace 'russetleaf.dev' 'russetleaf.com' --all-tables` to fix links and settings
+  4. copies the media with `aws s3 sync` from the russetleaf.dev media bucket to the russetleaf.com media bucket
+
+  Its IAM role (IRSA) may only read the russetleaf.dev backup and media buckets and write to the russetleaf.com media bucket. After it runs, russetleaf.com shows the same posts as the live site, and the next final snapshot keeps them.
 
 ### Always-on cost for russetleaf.com
 
@@ -393,6 +400,55 @@ Box 1 is the tight one: Talos, Argo CD, monitoring, WordPress and the platform s
 
 The cluster still has a single control plane, so it isn't highly available. That's acceptable for a home lab; the AWS design covers high availability.
 
+### russetleaf.dev database backups
+**MariaDB Operator** (not Talos) backs up the russetleaf.dev database. Talos has its own snapshot feature, but it only covers the cluster's internal state (etcd), not application data. The operator's `Backup` resource, deployed by Argo CD from `wp-gitops/platform/mariadb/`, runs a scheduled dump and uploads it to S3.
+
+| Setting | Value |
+|---|---|
+| Backup type | **Logical** (`mariadb-dump`, plain SQL, gzip-compressed). It can be restored into the home MariaDB **and** into RDS for MariaDB. Physical backups (`mariadb-backup`) can't be restored into RDS. |
+| Schedule | Daily at 03:00 |
+| Retention | 14 days (the operator's `maxRetention`), plus an S3 lifecycle rule as a safety net |
+| Bucket | `russetleaf-dev-db-backups` (example name), created in `wp-infra/envs/home` with the `s3-backups` module: versioning on, encryption on, public access blocked, objects and old versions expire after 30 days |
+| Credentials | IAM key allowed only to write to and read from that bucket, kept in Secrets Manager and synced by External Secrets (or a keyless IAM role once the OIDC stretch goal is done) |
+| Monitoring | The `Backup` runs as a Kubernetes CronJob, so kube-state-metrics reports its last success. Alertmanager alerts if the last successful backup is more than 26 hours old. |
+| Restore test | Monthly: restore the latest backup into a scratch MariaDB instance in the cluster (the operator's `Restore` resource, or a new `MariaDB` that bootstraps from the backup), check the post count, then delete it |
+| Cost | Under $1/month (daily dumps of a small site are a few MB each) |
+
+Example `Backup` resource (outline; check field names against the operator version you install):
+
+```yaml
+apiVersion: k8s.mariadb.com/v1alpha1
+kind: Backup
+metadata:
+  name: russetleaf-dev-daily
+  namespace: wordpress
+spec:
+  mariaDbRef:
+    name: mariadb
+  schedule:
+    cron: "0 3 * * *"
+  maxRetention: 336h            # 14 days
+  compression: gzip
+  storage:
+    s3:
+      bucket: russetleaf-dev-db-backups
+      prefix: mariadb
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      accessKeyIdSecretKeyRef:
+        name: mariadb-backup-s3     # synced from Secrets Manager by External Secrets
+        key: access-key-id
+      secretAccessKeySecretKeyRef:
+        name: mariadb-backup-s3
+        key: secret-access-key
+      tls:
+        enabled: true
+```
+
+**Same engine on both sites:** russetleaf.com uses **RDS for MariaDB**, so russetleaf.dev's backups restore into it directly, with no collation rewrites or MySQL compatibility fixes. Pin the home MariaDB to the **same major version** RDS offers (e.g. 11.4 LTS), so a dump from one always loads into the other.
+
+**Media is backed up separately:** uploads live in russetleaf.dev's S3 media bucket, which has versioning on, so deleted or overwritten files can be recovered from older versions.
+
 Two parts of the AWS design deliberately don't run at home:
 - **Karpenter** needs a cloud provider to create nodes; the home nodes are fixed hardware.
 - **kube-bench** looks for config files and processes where most Linux distributions keep them, and Talos doesn't, so many checks fail or come back "not applicable". Talos is hardened by default (no shell or SSH, read-only system, API-only management), so the home lab documents how Talos meets the CIS benchmark instead, and relies on Trivy Operator's compliance reports for continuous checks.
@@ -408,14 +464,14 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Ingress / edge | Cloudflare Tunnel + Cloudflare WAF (free plan) → ingress-nginx | CloudFront (always on) → ALB + AWS WAF | $0 |
 | DNS | Cloudflare (russetleaf.dev) | Route 53 (russetleaf.com) + ExternalDNS | $0 |
 | Offline page | n/a | S3 + CloudFront error fallback, pointing to russetleaf.dev | (in the edge row below) |
-| Database | MariaDB in-cluster (MariaDB Operator) | RDS MySQL Multi-AZ, restored from snapshot | $0 |
+| Database | MariaDB in-cluster (MariaDB Operator) | RDS for MariaDB Multi-AZ, restored from snapshot | $0 |
 | Object cache | Valkey in-cluster | ElastiCache Valkey | $0 |
 | Volumes | local-path-provisioner or Longhorn | EBS | $0 |
 | Media | **Real S3 bucket** (russetleaf.dev) + offload plugin | Its own S3 bucket (always on) + CloudFront | ~$1 |
 | Secrets | **Real AWS Secrets Manager** + External Secrets Operator | Same | ~$2 |
 | Container images | GHCR (free) or ECR | ECR | $0–$1 |
 | Monitoring | kube-prometheus-stack (Prometheus, Grafana, Alertmanager) + LLM metrics | Same, or Amazon Managed Prometheus | $0 |
-| Database backups | MariaDB Operator backups to **S3** | RDS automated snapshots | ~$1 |
+| Database backups | Daily MariaDB Operator logical backups to **S3** (14-day retention) | RDS automated backups + final snapshot on destroy | <$1 |
 | AI post summaries | **Real SQS** + KEDA-scaled summarizer | Same, in EKS | <$1 |
 | LLM gateway | LiteLLM in-cluster, routing to **real Amazon Bedrock** and the self-hosted model | Same | ~$1–$2 (Bedrock tokens) |
 | Self-hosted model | llama.cpp (CPU build) on box 2 | llama.cpp (CUDA build) on the Karpenter GPU NodePool | ~$2–$4 (electricity for box 2) |
@@ -508,6 +564,8 @@ wp-gitops/
     wordpress/              # Bitnami chart values (image tag pinned), Argo Rollouts canary + analysis
     post-summarizer/        # values for the llm-summarizer Helm chart (chart version pinned), per environment:
                             #   queue URL, gateway URL, scaling limits, IAM role
+    seed-from-dev/          # one-off Job: load the latest russetleaf.dev backup + media into russetleaf.com
+                            #   (aws only, manual sync)
   platform/                 # shared cluster services, each with base + overlays/home, overlays/aws
     monitoring/             # kube-prometheus-stack, Grafana dashboards, alert rules
     external-secrets/       # External Secrets Operator + AWS Secrets Manager store
@@ -515,7 +573,7 @@ wp-gitops/
     external-dns/           # ExternalDNS, manages origin.russetleaf.com in Route 53 (aws only)
     cloudflared/            # Cloudflare Tunnel connector (home only)
     storage/                # home: local-path-provisioner or Longhorn; aws: EBS CSI StorageClass
-    mariadb/                # MariaDB Operator + database (home only; RDS on AWS)
+    mariadb/                # MariaDB Operator + database + scheduled Backup to S3 (home only; RDS on AWS)
     valkey/                 # Valkey object cache (home only; ElastiCache on AWS)
     keda/                   # KEDA operator (event-driven autoscaling)
     argo-rollouts/          # Argo Rollouts controller (canary releases)
@@ -547,6 +605,7 @@ wp-infra/
                             #   IAM roles for each repo's CI (plan, apply, image push)
   modules/                  # reusable modules shared by both environments
     s3-media/               # media bucket, versioning, IAM policy
+    s3-backups/             # database backup bucket: versioning, encryption, lifecycle rules, IAM policy
     sqs-queue/              # queue + dead-letter queue + alarms
     secrets/                # Secrets Manager entries
     bedrock-access/         # model access, gateway IAM role, Bedrock budget alert
@@ -563,7 +622,7 @@ wp-infra/
                             #   secret header) from its remote state
     home/                   # russetleaf.dev: Talos machine configs (box 1 control plane; box 2 LLM worker with
                             #   label and taint), Cloudflare tunnel/DNS/WAF, plus the shared modules
-                            #   (S3, SQS, Secrets Manager, Bedrock IAM)
+                            #   (media and database-backup buckets, SQS, Secrets Manager, Bedrock IAM)
   .github/workflows/        # fmt, validate, tflint, Checkov and plan on every pull request (plan posted as a
                             #   comment); apply on merge to main, with a manual approval step
 ```
