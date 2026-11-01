@@ -152,7 +152,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 | Requests and limits | **Require Requests and Limits** (`require-requests-limits`) | CPU and memory **requests** and a **memory limit** on every container. **CPU limits are deliberately not required**: they cause throttling (slowing WordPress and llama.cpp) without protecting anything; memory limits are what protect box 1 |
 | No privileged containers | **Disallow Privileged Containers** (`disallow-privileged-containers`), within Kyverno's **Pod Security Standards** `baseline` rule set | No privileged containers, host paths or host namespaces (network, PID, IPC). Talos already enforces Pod Security `baseline`; Kyverno adds reporting, CI tests and narrow exceptions |
 | Run as non-root | **Require Run As Non-Root** (`require-run-as-nonroot`), from the Pod Security `restricted` set | Containers run as a non-root user. The WordPress image runs Apache as `www-data` on port 8080 (non-root processes can't use port 80) |
-| Read-only root filesystem | **Require Read-Only Root Filesystem** (`require-ro-rootfs`) | Containers can't write to their own filesystem. WordPress gets small writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions and the uploads directory (the offload plugin writes files there briefly before moving them to S3). Backs up the Falco rule on writes to `/var/www/html` |
+| Read-only root filesystem | **Require Read-Only Root Filesystem** (`require-ro-rootfs`) | Containers can't write to their own filesystem. WordPress gets small writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions and, only if the chosen offload plugin writes uploads locally first, the uploads directory. Backs up the Falco rule on writes to `/var/www/html` |
 | Health probes | **Require Pod Probes** (`require-pod-probes`) | Readiness and liveness probes on every long-running workload; Argo Rollouts, the HPA and Kubernetes' own restarts depend on them |
 | No NodePorts | **Disallow NodePort** (`restrict-nodeport`), plus a rule blocking `LoadBalancer` Services | Nothing needs them: traffic arrives through the Cloudflare Tunnel at home and through the ALB (created from an Ingress, target type `ip`) on AWS |
 | Unique Ingress hosts | **Unique Ingress Host and Path** (`unique-ingress-host-and-path`), which looks up existing Ingresses before admitting a new one | Two Ingresses can't claim the same host and path (e.g. a staging or admin hostname colliding with production) |
@@ -176,9 +176,36 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 
 ### Stateless operation
 - **Custom WordPress image** with plugins and themes built in, built by the `wp-image` repo's CI, pushed to the registry, and deployed by Argo CD.
-- **Media uploads offloaded to S3** (e.g. the WP Offload Media plugin), so WordPress pods need no volume (`persistence.enabled: false`).
+- **Media uploads offloaded to S3** (S3-Uploads or WP Offload Media, chosen in home plan step 5.1), so WordPress pods need no persistent volume (`persistence.enabled: false`). Not EFS, by decision; see [Media storage: S3, not EFS](#media-storage-s3-not-efs-by-decision).
 - **WP-Cron turned off** in WordPress (`DISABLE_WP_CRON`) and run as a **Kubernetes CronJob** instead.
 - **Outgoing email through Amazon SES** with an SMTP plugin; each site has its own SES domain identity with DKIM.
+
+### Media storage: S3, not EFS (by decision)
+Many WordPress-on-AWS guides, including AWS's own reference architecture, put `wp-content` on **EFS**, a shared network filesystem mounted by every server. This project deliberately doesn't. Media goes to **S3**, and WordPress's code (core, plugins, themes) is **built into the container image**. The reasoning is recorded as an ADR, `docs/adr/0002-s3-media-not-efs.md` in `wp-gitops`.
+
+**Two production patterns, for two kinds of site:**
+- **EFS (shared `wp-content`):** traditional or lift-and-shift WordPress on EC2 Auto Scaling groups. It needs no changes to WordPress, so admin-screen plugin installs, caching plugins and plugins that write files all just work. The right choice when site owners install plugins themselves.
+- **S3 media + immutable images:** containerised, GitOps-managed WordPress, the approach taken by large platforms such as WordPress VIP and Human Made's Altis (which publishes the open-source S3-Uploads plugin for it). This project is this kind of site.
+
+| | EFS (shared `wp-content`) | S3 media + code in the image (this design) |
+|---|---|---|
+| What's running | Can change at runtime (admin installs, plugin updates, edited files), so it drifts from Git | **Exactly what's in Git**: a signed, scanned image, pinned by digest |
+| Rollback | Rolling back the image doesn't roll back files changed on EFS | Roll back the image version; done |
+| Security | A writable code directory is where attackers hide web shells, and they persist across restarts | Read-only root filesystem (Kyverno), Falco alerts on writes to `/var/www/html`; a compromised pod is replaced clean |
+| Performance | PHP reads many small files per request, each over the network (needs careful OPcache tuning) | Code is on local disk in the image; media is served by the CDN straight from S3 |
+| Cost | ~$0.30/GB-month, plus throughput charges at scale | ~$0.023/GB-month; the CDN serves media without touching the pods |
+| Home lab | No EFS at home; would need an NFS server (more load on 8 GB) | The same S3 approach works identically at home |
+| Staging, ci, promotion | A shared filesystem per environment, kept in sync somehow | Each environment points at its own bucket |
+
+**What it costs:** no plugin installs from the admin screen (every plugin change is a new image through CI and staging, which is the point here); plugins that write files (some caching, form and backup plugins) need checking or a writable scratch volume; the media offload plugin becomes a key dependency.
+
+**When EFS would be the better choice** (also in the ADR): non-technical editors need to install plugins themselves, or the site relies on plugins that must write to `wp-content` and can't be replaced.
+
+**Offload plugin:** two candidates, compared in home plan step 5.1:
+- **S3-Uploads** (Human Made, open source): stores uploads **directly in S3** through a PHP stream wrapper, so nothing is written locally. The best fit for a read-only container.
+- **WP Offload Media Lite** (Delicious Brains): writes each upload to the local uploads directory first, then copies it to S3 (and can delete the local copy). Needs a writable `emptyDir` for uploads.
+
+Whichever is chosen must also work with a **custom S3 endpoint**, so the ci tests can use the LocalStack or MinIO stand-ins.
 
 ### Backup and recovery
 - Automated **RDS backups** with point-in-time recovery, plus a **final snapshot** each time the russetleaf.com demo stack is destroyed.
@@ -880,7 +907,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **A four-repo GitOps structure:** infrastructure, deployment config, the WordPress image and the summarizer are separated by purpose and permissions, with automated, reviewed promotion of signed images and charts into the GitOps repo.
 - **LLM monitoring:** token, latency, error, fallback and cost metrics per model and prompt version, plus model-server throughput, in Prometheus and Grafana, with alerts.
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
-- **Architecture decision records:** documented choices with their trade-offs, e.g. why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
+- **Architecture decision records:** documented choices with their trade-offs, e.g. why media is on S3 rather than the commonly recommended EFS, and why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
 - **Zero-trust networking with Cilium on both clusters:** WireGuard encryption between nodes, default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
 - **Supply-chain security and policy as code:** SBOMs, vulnerability scans and signed images in CI, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov on the Terraform.
 - **Runtime security and compliance:** Falco rules written for this application (shells in pods, writes to WordPress code, unexpected egress from LLM nodes), alerts in Grafana, CIS benchmark reports from kube-bench on EKS, and continuous Trivy Operator compliance reports on both clusters.
@@ -935,7 +962,8 @@ wp-gitops/
     homelab-plan.md         # build plan for russetleaf.dev
     aws-eks-plan.md         # build plan for russetleaf.com
     runbooks/               # one page per alert: what it means, how to check, how to fix
-    adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md)
+    adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md,
+                            #   0002-s3-media-not-efs.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/

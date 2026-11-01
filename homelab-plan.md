@@ -159,7 +159,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log.
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. Planned ADRs include `0001-no-service-mesh.md` (step 6.4) and `0002-s3-media-not-efs.md` (step 5.1).
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
 - In `wp-gitops`: move `aws-wp.md` and this file to `docs/`, and write the hub README (what the project is, links to all four repos).
@@ -265,8 +265,13 @@ Check `kubectl top nodes` after each step.
 
 ### Step 5.1: The WordPress image (`wp-image`)
 **Do:**
-- `Dockerfile` based on the official `wordpress` image (pinned version), with plugins and themes pinned in `plugins.json` and installed at build time: S3 media offload (e.g. WP Offload Media Lite), Redis Object Cache, an SMTP plugin (configured for Amazon SES). WordPress code is copied into `/var/www/html` **at build time**, so the image's startup script has nothing to copy at runtime.
-- **Built to pass the Kyverno policies from step 6.1:** Apache runs as **`www-data`** listening on **port 8080** (non-root can't use port 80), and the container works with a **read-only root filesystem** given writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions and the uploads directory. Test both in the Compose smoke test.
+- `Dockerfile` based on the official `wordpress` image (pinned version), with plugins and themes pinned in `plugins.json` and installed at build time: an S3 media offload plugin (see the comparison below), Redis Object Cache, an SMTP plugin (configured for Amazon SES). WordPress code is copied into `/var/www/html` **at build time**, so the image's startup script has nothing to copy at runtime.
+- **Choose the S3 offload plugin** (see [Media storage: S3, not EFS](aws-wp.md#media-storage-s3-not-efs-by-decision)). Try both in the Compose setup against LocalStack (or MinIO) and record the choice in the decision log:
+  - **S3-Uploads** (Human Made, open source): uploads go **directly to S3**, so no writable uploads directory is needed. Preferred if it works with a custom S3 endpoint (for the ci stand-ins) and with CloudFront as the media URL.
+  - **WP Offload Media Lite**: writes locally first, then copies to S3; needs a writable uploads `emptyDir`.
+  - Check for both: upload, image resizing (thumbnails), deleting media, and the media URL pointing at the right place (S3 at home, CloudFront on AWS).
+- **Write `docs/adr/0002-s3-media-not-efs.md`** in `wp-gitops`: the EFS vs S3 comparison, the plugin chosen and why, and when EFS would be the better choice.
+- **Built to pass the Kyverno policies from step 6.1:** Apache runs as **`www-data`** listening on **port 8080** (non-root can't use port 80), and the container works with a **read-only root filesystem** given writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions, and the uploads directory only if the chosen plugin needs it. Test both in the Compose smoke test.
 - `wp-config` settings read from environment variables (database, Valkey, S3, queue URL, `WP_HOME`/`WP_SITEURL`, `DISALLOW_FILE_MODS`, `DISABLE_WP_CRON`), with **TLS to the database** turned on.
 - A **`db.php` drop-in** whose behaviour is chosen by the chart setting **`database.auth`**. Build only the **`password`** mode now (reads the password from a Secret, connects over TLS); it's what the home lab uses, and it's the AWS fallback too. Leave a clear extension point for an **`iam`** mode, which is written **only after** the AWS plan's early test (step 1.6) shows that PHP can log in to RDS Proxy with an IAM token. That way no work is wasted if the test fails. Add the **RDS CA certificate bundle** to the image now (harmless at home, needed on AWS).
 - The **summary-queue must-use plugin**: on publish or update, send `{"post_id": ...}` to SQS (AWS SDK for PHP, installed with Composer at build time).
