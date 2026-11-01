@@ -4,6 +4,8 @@ EKS, the WordPress Helm chart, S3 media offload and RDS together make a standard
 
 The project runs **two separate WordPress sites** from the same code and manifests: **russetleaf.com** on the full AWS design (brought up only for demos) and **russetleaf.dev** on a budget home lab (running 24/7). See [The two sites](#the-two-sites).
 
+Step-by-step build plans: [`homelab-plan.md`](homelab-plan.md) (russetleaf.dev, built first) and [`aws-eks-plan.md`](aws-eks-plan.md) (russetleaf.com, built second).
+
 The project is split across **four Git repositories** (`wp-gitops`, `wp-infra`, `wp-image` and `llm-summarizer`); see [Repository structure](#repository-structure-four-repos) at the end.
 
 ## The two sites
@@ -23,6 +25,9 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Media | Its own S3 bucket (always on), served through CloudFront | Its own S3 bucket |
 | Summary queue | Its own SQS queue + dead-letter queue | Its own SQS queue + dead-letter queue |
 | Secrets | Its own Secrets Manager entries | Its own Secrets Manager entries |
+| Email | Amazon SES, its own domain identity (DKIM records in Route 53) | Amazon SES, its own domain identity (DKIM records in Cloudflare) |
+| Network policies | Enforced by the VPC CNI's network policy support | Enforced by Cilium (if chosen as the CNI; Talos's default Flannel doesn't enforce them) |
+| AWS resource tags | `Project=russetleaf`, `Site=com` | `Project=russetleaf`, `Site=dev` |
 | Self-hosted model | llama.cpp (CUDA build) on a Karpenter GPU node | llama.cpp (CPU build) on box 2 |
 | Bedrock | Same models through the gateway, with its own budget alert | Same models through the gateway, with its own budget alert |
 | Terraform environment (`wp-infra`) | `envs/aws-edge` (always on) + `envs/aws` (demo stack) | `envs/home` |
@@ -113,14 +118,15 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 
 ### Performance
 - **Object cache** (ElastiCache Redis or Valkey) with a Redis object-cache plugin. This cuts database load sharply.
-- **PHP OPcache** (on by default in the Bitnami image).
+- **PHP OPcache** (enabled in the custom WordPress image).
 
 ### Security
-- S3, SQS and Bedrock access through **IRSA or EKS Pod Identity**, not stored AWS access keys. Each role gets only what it needs:
+- S3, SQS, SES and Bedrock access through **EKS Pod Identity** (IRSA only for any component that doesn't support Pod Identity), not stored AWS access keys. Each role gets only what it needs:
   - WordPress may write to its S3 bucket and send to the queue.
   - The summarizer may read from the queue; it reaches models only through the gateway.
   - The LLM gateway may call `bedrock:InvokeModel` on the chosen Bedrock models only.
 - Database password in **AWS Secrets Manager**, synced into the cluster by **External Secrets Operator**.
+- **NetworkPolicies**: default-deny in each application namespace, then only the connections each workload needs (e.g. only WordPress may reach the database). On EKS, turn on network policy enforcement in the VPC CNI add-on.
 - RDS in **private subnets**, with **TLS required** on connections.
 - `DISALLOW_FILE_MODS` set to `true` (no plugin or theme installs from the admin screen).
 
@@ -147,7 +153,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 - **Custom WordPress image** with plugins and themes built in, built by the `wp-image` repo's CI, pushed to the registry, and deployed by Argo CD.
 - **Media uploads offloaded to S3** (e.g. the WP Offload Media plugin), so WordPress pods need no volume (`persistence.enabled: false`).
 - **WP-Cron turned off** in WordPress (`DISABLE_WP_CRON`) and run as a **Kubernetes CronJob** instead.
-- **Outgoing email through Amazon SES** with an SMTP plugin.
+- **Outgoing email through Amazon SES** with an SMTP plugin; each site has its own SES domain identity with DKIM.
 
 ### Backup and recovery
 - Automated **RDS backups** with point-in-time recovery, plus a **final snapshot** each time the russetleaf.com demo stack is destroyed.
@@ -163,12 +169,13 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
   - a **GPU pool** for the self-hosted model, with the `workload=llm` label and `dedicated=llm:NoSchedule` taint, on spot
   - **spot interruption handling** through an SQS queue fed by EventBridge, so pods move before AWS reclaims a spot node
 - **Cost visibility** with **OpenCost** (or the free Kubecost EKS bundle, which reads AWS billing data): cost per namespace, workload and node, including the GPU node's share and cost per summary alongside the Bedrock spend.
-- **Progressive delivery** with **Argo Rollouts**: new WordPress and summarizer versions go out as canaries (e.g. 10% → 50% → 100%). An analysis step checks Prometheus metrics (error rate, latency) at each stage and **rolls back automatically** if they get worse.
+- **Progressive delivery** with **Argo Rollouts**: new WordPress and summarizer versions go out as canaries (e.g. 10% → 50% → 100%). An analysis step checks Prometheus metrics (error rate, latency) at each stage and **rolls back automatically** if they get worse. The metrics come from **CloudWatch** on AWS (ALB 5xx rate and response time, through Argo Rollouts' CloudWatch provider) and from **ingress-nginx's Prometheus metrics** at home.
 - **Metrics, logs and alerts**: Prometheus, Grafana and Alertmanager (or CloudWatch Container Insights), including the LLM metrics described below.
 - **AWS Budgets alerts**, including one on Bedrock spending, in case a bug calls the model in a loop.
+- **Tagging**: every AWS resource gets `Project`, `Site` and `ManagedBy` tags (plus `Stack=edge|demo` on russetleaf.com) through the AWS provider's `default_tags`, so leftovers can be found and costs split per site.
 
-### Bitnami caveat
-Since Bitnami cut back its free images in 2025, many teams use the Bitnami chart with their **own image** (built from the official `wordpress` image or from Bitnami's source). Alternatively, they write a small chart of their own. A custom image fits this design anyway.
+### WordPress image and Helm chart
+The site uses a **custom image built on the official `wordpress` image** and a **small Helm chart of its own** (Deployment/Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob), both maintained in the `wp-image` repo and released together. The Bitnami WordPress chart isn't used: it only works with Bitnami-format images, and Bitnami cut back its free images in 2025. Owning the chart removes that dependency and keeps every setting visible.
 
 ## AI post summaries
 
@@ -179,7 +186,7 @@ Since Bitnami cut back its free images in 2025, many teams use the Bitnami chart
 4. Failed messages are retried and, after several attempts, moved to an **SQS dead-letter queue**, which has an alert on it.
 5. A daily **CronJob sweep** re-queues any posts still missing a summary, as a backstop.
 
-The summarizer authenticates to WordPress with an **application password** stored in **Secrets Manager** and synced by External Secrets. It reaches SQS through **IRSA or Pod Identity**. **Bedrock model access** must be enabled for each chosen model in the region.
+The summarizer authenticates to WordPress with an **application password** stored in **Secrets Manager** and synced by External Secrets. It reaches SQS through **EKS Pod Identity** (scoped IAM keys at home). **Bedrock model access** must be enabled for each chosen model in the region.
 
 ### LLM gateway and model serving
 - **LiteLLM** runs in the cluster as the single entry point for all model calls. It gives the summarizer one OpenAI-compatible API, whichever model answers.
@@ -194,9 +201,9 @@ The summarizer authenticates to WordPress with an **application password** store
 - The self-hosted model runs on **dedicated LLM nodes** (a Karpenter GPU NodePool on AWS, box 2 at home):
   - The nodes carry the label `workload=llm` and the taint `dedicated=llm:NoSchedule`, so only the model server (plus cluster-wide agents such as node-exporter) runs there.
   - The model server Deployment has a matching **toleration** and **node selector**.
-  - Model files are downloaded once from S3 or Hugging Face by an init container into a volume on the node.
+  - Model files are downloaded once by an init container from each site's **model mirror bucket** in S3 (so rebuilds don't depend on Hugging Face) into a volume on the node.
   - The model **stays loaded**, since the node is dedicated to it; KEDA scales only the summarizer.
-- On AWS, the LLM nodes come from Karpenter's **GPU NodePool** (e.g. g6.xlarge on spot), using a CUDA build of llama.cpp. At home, it's a **dedicated CPU worker node** (see the home lab section). The same manifests deploy both, with per-environment overlays.
+- On AWS, the LLM nodes come from Karpenter's **GPU NodePool** (e.g. g6.xlarge on spot), using a CUDA build of llama.cpp. At home, it's a **dedicated CPU worker node** (see the home lab section). The same manifests deploy both, with per-environment overlays. On EKS, the **NVIDIA device plugin** (a DaemonSet) lets the model server request the GPU (`nvidia.com/gpu: 1`); the Amazon Linux 2023 NVIDIA AMI already includes the drivers.
 
 ### Prompt versioning and evaluation in CI
 The summarizer is its own repo, `llm-summarizer`, built to stand alone as an MLOps project (see [Repository structure](#repository-structure-four-repos)).
@@ -225,50 +232,65 @@ Prometheus also collects the gateway's metrics (requests, spend and fallbacks pe
 
 ## Example Helm values (outline)
 
-These are the russetleaf.com (AWS overlay) values. The russetleaf.dev overlay differs only in the site-specific settings: its domain, the in-cluster MariaDB and Valkey hosts, ingress-nginx instead of the ALB, its own queue URL and IAM credentials.
+These are illustrative russetleaf.com (AWS overlay) values for the project's own WordPress chart; the exact keys are defined when the chart is written. The russetleaf.dev overlay differs only in the site-specific settings: its domain, the in-cluster MariaDB and Valkey hosts, ingress-nginx instead of the ALB, its own bucket, queue and email settings, scoped keys instead of Pod Identity, and the Prometheus-based canary analysis.
 
 ```yaml
 image:
-  registry: <account-id>.dkr.ecr.<region>.amazonaws.com
-  repository: wordpress-custom
-  tag: "1.0.0"
+  repository: ghcr.io/<github-user>/wp-image
+  tag: "1.0.0"                     # bumped by the wp-image release bot
 
-replicaCount: 3
+site:
+  url: https://russetleaf.com      # sets WP_HOME and WP_SITEURL
+
+replicas: 3
 autoscaling:
   enabled: true
   minReplicas: 3
   maxReplicas: 10
-pdb:
-  create: true
+podDisruptionBudget:
+  minAvailable: 2
+topologySpread: zone               # spread pods across availability zones
 
-persistence:
-  enabled: false          # media lives in S3; code lives in the image
-
-mariadb:
-  enabled: false
-externalDatabase:
+database:
   host: <rds-endpoint>.rds.amazonaws.com
   port: 3306
+  name: wordpress
   user: wordpress
-  database: wordpress
-  existingSecret: wordpress-db   # synced from Secrets Manager by External Secrets
+  existingSecret: wordpress-db     # synced from Secrets Manager by External Secrets
+  tls: true
+
+cache:
+  host: <valkey-endpoint>
+  tls: true
+  existingSecret: valkey-auth
+
+media:
+  bucket: russetleaf-com-media
+  cdnDomain: russetleaf.com        # media served through CloudFront
+
+summaryQueue:
+  url: https://sqs.us-east-1.amazonaws.com/<account-id>/russetleaf-com-post-summaries
+
+email:
+  smtpSecret: ses-smtp             # Amazon SES SMTP credentials
 
 serviceAccount:
-  create: true
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/wordpress   # IRSA for S3 + SQS access
+  create: true                     # AWS access (S3, SQS, SES) via EKS Pod Identity; no annotation needed
 
-resources:                 # required by the Kyverno policies
+resources:                         # required by the Kyverno policies
   requests:
     cpu: 250m
     memory: 256Mi
   limits:
     memory: 512Mi
 
+wpCron:
+  enabled: true                    # WP-Cron as a Kubernetes CronJob
+  schedule: "*/5 * * * *"
+
 ingress:
-  enabled: true
-  ingressClassName: alb
-  hostname: origin.russetleaf.com          # CloudFront's origin; visitors use russetleaf.com
+  className: alb
+  host: origin.russetleaf.com      # CloudFront's origin; visitors use russetleaf.com
   annotations:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
@@ -276,13 +298,13 @@ ingress:
     alb.ingress.kubernetes.io/wafv2-acl-arn: <waf-web-acl-arn>
     external-dns.alpha.kubernetes.io/hostname: origin.russetleaf.com
 
-wordpressExtraConfigContent: |
-  define('WP_HOME', 'https://russetleaf.com');
-  define('WP_SITEURL', 'https://russetleaf.com');
+rollout:
+  canarySteps: [20, 50, 100]
+  analysisTemplate: cloudwatch-alb # home overlay: prometheus-ingress-nginx
+
+extraConfig: |
   define('DISALLOW_FILE_MODS', true);
   define('DISABLE_WP_CRON', true);
-  define('WP_REDIS_HOST', '<valkey-endpoint>');
-  define('SUMMARY_QUEUE_URL', 'https://sqs.<region>.amazonaws.com/<account-id>/post-summaries');
 ```
 
 ## Estimated monthly AWS costs
@@ -299,13 +321,13 @@ These are approximate prices for **us-east-1**, on demand unless noted, for a sm
 | RDS storage | 50 GB gp3, Multi-AZ | ~$12 |
 | ElastiCache Valkey | 2 × cache.t4g.small (primary + replica) | ~$37 |
 | Application Load Balancer | 1 ALB + light LCU usage | ~$22 |
-| NAT Gateways | 3 (one per AZ) + light data processing | ~$100 |
+| NAT Gateways | 3 (one per AZ) + light data processing; demos use 1 to save cost | ~$100 |
 | Public IPv4 addresses | ~6 (ALB + NAT), $0.005/hr each | ~$22 |
 | CloudFront | ~1 TB out / 10M requests (free tier or flat-rate plan) | $0–$15 |
 | AWS WAF | 1 web ACL + a few managed rules | ~$10 |
 | S3 (media + model files) | ~60 GB + requests, versioning on | ~$2 |
 | Secrets Manager | ~5 secrets | ~$2 |
-| ECR | a few GB of images | ~$1 |
+| Container images | GHCR (free for public images); optional ECR pull-through cache | $0–$1 |
 | CloudWatch (logs + Container Insights) | moderate log volume | ~$20 |
 | Route 53 | 1 hosted zone + queries | ~$1 |
 | ACM certificates | public certificates | $0 |
@@ -327,7 +349,7 @@ When the EKS demo stack isn't running, **russetleaf.com must still answer** with
 
 ### Mechanism: an always-on CloudFront edge with error fallback (recommended)
 Split the AWS Terraform into two root modules in `wp-infra`:
-- **`envs/aws-edge` (always on, ~$1/month):** the Route 53 hosted zone for russetleaf.com, ACM certificates, the CloudFront distribution, the S3 bucket holding the offline page, the russetleaf.com **media bucket**, and the secret header value CloudFront sends to the ALB.
+- **`envs/aws-edge` (always on, ~$1/month):** the Route 53 hosted zone for russetleaf.com, ACM certificates, the CloudFront distribution, the S3 bucket holding the offline page, the russetleaf.com **media bucket**, the **model mirror bucket**, and the secret header value CloudFront sends to the ALB.
 - **`envs/aws` (demo stack):** everything else (VPC, EKS, Karpenter, RDS, ElastiCache, WAF, SQS, ...). The ALB itself is created by the AWS Load Balancer Controller from the WordPress Ingress, and **ExternalDNS** creates the `origin.russetleaf.com` record pointing at it.
 
 The CloudFront distribution is set up like this:
@@ -363,7 +385,7 @@ Each demo creates a new RDS instance, so content needs a plan:
   3. runs `wp search-replace 'russetleaf.dev' 'russetleaf.com' --all-tables` to fix links and settings
   4. copies the media with `aws s3 sync` from the russetleaf.dev media bucket to the russetleaf.com media bucket
 
-  Its IAM role (IRSA) may only read the russetleaf.dev backup and media buckets and write to the russetleaf.com media bucket. After it runs, russetleaf.com shows the same posts as the live site, and the next final snapshot keeps them.
+  Its IAM role (Pod Identity) may only read the russetleaf.dev backup and media buckets and write to the russetleaf.com media bucket. After it runs, russetleaf.com shows the same posts as the live site, and the next final snapshot keeps them.
 
 ### Always-on cost for russetleaf.com
 
@@ -469,7 +491,7 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Volumes | local-path-provisioner or Longhorn | EBS | $0 |
 | Media | **Real S3 bucket** (russetleaf.dev) + offload plugin | Its own S3 bucket (always on) + CloudFront | ~$1 |
 | Secrets | **Real AWS Secrets Manager** + External Secrets Operator | Same | ~$2 |
-| Container images | GHCR (free) or ECR | ECR | $0–$1 |
+| Container images | GHCR (free) | GHCR (optional ECR pull-through cache) | $0 |
 | Monitoring | kube-prometheus-stack (Prometheus, Grafana, Alertmanager) + LLM metrics | Same, or Amazon Managed Prometheus | $0 |
 | Database backups | Daily MariaDB Operator logical backups to **S3** (14-day retention) | RDS automated backups + final snapshot on destroy | <$1 |
 | AI post summaries | **Real SQS** + KEDA-scaled summarizer | Same, in EKS | <$1 |
@@ -478,6 +500,8 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Prompt evaluation | GitHub Actions on ARC runners in the cluster | Same | (included above) |
 | Progressive delivery | Argo Rollouts | Same | $0 |
 | Supply chain and policy | cosign, Syft, Trivy, Kyverno CLI in CI; Kyverno in the cluster | Same | $0 |
+| Network policies | Cilium (if chosen as the CNI) | VPC CNI network policy enforcement | $0 |
+| Email | Amazon SES (russetleaf.dev identity) | Amazon SES (russetleaf.com identity) | <$1 |
 | Runtime security | Falco + Falcosidekick | Same (or GuardDuty EKS Runtime Monitoring) | $0 |
 | Compliance | Talos hardened defaults (documented) + Trivy Operator | kube-bench (EKS profile) + Trivy Operator | $0 |
 | Cost visibility | OpenCost | OpenCost or Kubecost EKS bundle | $0 |
@@ -485,7 +509,7 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | **Total (24/7)** | | | **~$8–$15 / month** |
 
 ### Short AWS demos
-The full AWS design costs roughly **$1.00/hour** while running, including about $0.25–$0.35/hour for the spot GPU node. Run `terraform apply` in `envs/aws`, record a walkthrough of russetleaf.com or take screenshots, then tear it down (see [Building it from scratch](#building-it-from-scratch) for the exact order). The always-on edge (`envs/aws-edge`) is never destroyed, so russetleaf.com switches to its offline page automatically.
+The full AWS design costs roughly **$1.00/hour** while running, including about $0.25–$0.35/hour for the spot GPU node. Run `terraform apply` in `envs/aws`, record a walkthrough of russetleaf.com or take screenshots, then tear it down. The `demo-up` and `demo-down` GitHub Actions workflows in `wp-infra` do this in the right order, and a scheduled safety-net workflow alerts (or tears down) if the stack is left running too long; see [Building it from scratch](#building-it-from-scratch). The always-on edge (`envs/aws-edge`) is never destroyed, so russetleaf.com switches to its offline page automatically.
 
 | Demo time per month | Est. cost |
 |---|---|
@@ -555,13 +579,16 @@ wp-gitops/
   README.md                 # project hub: architecture diagram, links to all four repos, quick start
   docs/
     aws-wp.md               # this document
+    homelab-plan.md         # build plan for russetleaf.dev
+    aws-eks-plan.md         # build plan for russetleaf.com
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
     home/                   # root "app of apps" Application for the home cluster
     aws/                    # root "app of apps" Application for EKS
   apps/                     # the applications, each with base + overlays/home, overlays/aws
-    wordpress/              # Bitnami chart values (image tag pinned), Argo Rollouts canary + analysis
+    wordpress/              # values for the wp-image Helm chart (version pinned), analysis templates
+                            #   (home: Prometheus/ingress-nginx; aws: CloudWatch/ALB)
     post-summarizer/        # values for the llm-summarizer Helm chart (chart version pinned), per environment:
                             #   queue URL, gateway URL, scaling limits, IAM role
     seed-from-dev/          # one-off Job: load the latest russetleaf.dev backup + media into russetleaf.com
@@ -573,6 +600,8 @@ wp-gitops/
     external-dns/           # ExternalDNS, manages origin.russetleaf.com in Route 53 (aws only)
     cloudflared/            # Cloudflare Tunnel connector (home only)
     storage/                # home: local-path-provisioner or Longhorn; aws: EBS CSI StorageClass
+    cilium/                 # Cilium CNI with NetworkPolicy enforcement (home only, if chosen; EKS uses the VPC CNI)
+    nvidia-device-plugin/   # exposes GPUs to pods (aws only)
     mariadb/                # MariaDB Operator + database + scheduled Backup to S3 (home only; RDS on AWS)
     valkey/                 # Valkey object cache (home only; ElastiCache on AWS)
     keda/                   # KEDA operator (event-driven autoscaling)
@@ -614,6 +643,7 @@ wp-infra/
     aws-edge/               # russetleaf.com, ALWAYS ON (~$1/month): Route 53 hosted zone, ACM certificates
                             #   (us-east-1 for CloudFront; the ALB's region for origin.russetleaf.com), CloudFront
                             #   distribution with the offline-page fallback, offline-page bucket, media bucket,
+                            #   model mirror bucket, SES domain identity,
                             #   CloudFront-to-ALB secret header
     aws/                    # russetleaf.com DEMO STACK: VPC, EKS (small managed node group for Karpenter),
                             #   Karpenter IAM + interruption queue, RDS (restored from the latest snapshot),
@@ -622,7 +652,8 @@ wp-infra/
                             #   secret header) from its remote state
     home/                   # russetleaf.dev: Talos machine configs (box 1 control plane; box 2 LLM worker with
                             #   label and taint), Cloudflare tunnel/DNS/WAF, plus the shared modules
-                            #   (media and database-backup buckets, SQS, Secrets Manager, Bedrock IAM)
+                            #   (media, database-backup and model mirror buckets, SQS, Secrets Manager,
+                            #   SES identity, Bedrock IAM)
   .github/workflows/        # fmt, validate, tflint, Checkov and plan on every pull request (plan posted as a
                             #   comment); apply on merge to main, with a manual approval step
 ```
@@ -637,13 +668,15 @@ wp-infra/
 
 ```
 wp-image/
-  Dockerfile                # based on the official wordpress image (or Bitnami's source), plugins and themes added
+  Dockerfile                # based on the official wordpress image, plugins and themes added, OPcache on
   plugins.json              # pinned plugin and theme versions (offload media, Redis object cache, SMTP, ...)
+  chart/                    # the WordPress Helm chart: Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob,
+                            #   NetworkPolicy
   mu-plugins/
     summary-queue/          # sends post IDs to SQS when a post is published or updated
   tests/                    # smoke test: the container starts, plugins are active, health check passes
-  .github/workflows/        # build, SBOM (Syft), scan (Trivy), sign (cosign), push to the registry,
-                            #   open an image-bump pull request on wp-gitops
+  .github/workflows/        # build, SBOM (Syft), scan (Trivy), sign (cosign), push image + chart to GHCR,
+                            #   open a version-bump pull request on wp-gitops
 ```
 
 ### `llm-summarizer`: the standalone MLOps project
@@ -726,7 +759,7 @@ Work **infrastructure first, then code, then config**, so nothing is deployed be
 2. `terraform apply` in `wp-infra/envs/aws-edge`. This creates the hosted zone, certificates, CloudFront distribution, offline page and media bucket.
 3. Check that russetleaf.com shows the offline page with a link to russetleaf.dev.
 
-**russetleaf.com demo (each time):**
+**russetleaf.com demo (each time):** run the `demo-up` and `demo-down` workflows in `wp-infra`, which perform these steps:
 1. `terraform apply` in `wp-infra/envs/aws`. This creates the stack (restoring RDS from the latest snapshot) and installs Argo CD pointed at `wp-gitops/bootstrap/aws`.
 2. Wait for Argo CD to sync. Once ExternalDNS creates `origin.russetleaf.com`, russetleaf.com switches from the offline page to the live site on its own. Demo.
 3. Remove the Argo CD Applications (the ALB and `origin.russetleaf.com` are deleted, and russetleaf.com falls back to the offline page), then `terraform destroy` in `envs/aws`. Never destroy `envs/aws-edge`.
@@ -736,7 +769,7 @@ The current repo (`private-test-wordpress`) becomes `wp-gitops`:
 - Rename the repo on GitHub (GitHub redirects the old URL, but update the `repoURL` in Argo CD anyway).
 - Move `helm/wordpress/values.yaml` to `apps/wordpress/base/values.yaml`, and update the `$values` path in the WordPress Application.
 - Move `application.yaml` into the app-of-apps structure (`apps/wordpress/` plus `bootstrap/home/`).
-- Move this document to `docs/aws-wp.md`.
+- Move this document and the two build plans to `docs/`.
 - Before making the repo public, check its history for secrets (e.g. with `gitleaks`).
 
 **Keeping versions current:** enable **Renovate** (or Dependabot) on all four repos, for Helm chart versions, Terraform providers, base images, plugins and GitHub Actions. Each update then arrives as a pull request that goes through the same CI.
