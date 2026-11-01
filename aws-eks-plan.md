@@ -56,6 +56,7 @@ Record each answer in the [decision log](#decision-log).
 | **Pod AWS access** | **EKS Pod Identity** (the newer, simpler option) instead of IRSA, unless a component only supports IRSA. | Decides how every service account gets AWS permissions. Both avoid stored keys. |
 | **Image registry** | Keep **GHCR** for both sites (one registry, one Kyverno policy). Optional: an ECR pull-through cache for GHCR, so EKS pulls stay inside AWS. | `aws-wp.md` mentions ECR; this avoids running two registries. Update `aws-wp.md` once decided. |
 | **NAT Gateways** | **One** NAT Gateway for demos (saves about $65/month-equivalent while running), documented as "three in production". | Cost while the demo runs vs showing full AZ redundancy. |
+| **Networking** | **Decided: Cilium in chaining mode** with the Amazon VPC CNI (the VPC CNI assigns pod IPs; Cilium enforces **CiliumNetworkPolicies** and provides Hubble), matching the home lab's Cilium. | Same policies, dashboards and alerts on both clusters; staying on the VPC CNI for IP addressing keeps EKS close to its defaults. |
 | **Node OS** | **Amazon Linux 2023** EKS AMIs (with the NVIDIA variant for GPU nodes). | Falco's modern eBPF driver, the GPU drivers and Karpenter all support it. |
 | **Monitoring on AWS** | The same **kube-prometheus-stack** as the home lab, plus **CloudWatch** for things Prometheus can't see (ALB, RDS, ElastiCache metrics, via the CloudWatch exporter or Grafana's CloudWatch data source). Skip Container Insights for demos. | The Argo Rollouts analysis needs request metrics, which come from the ALB (CloudWatch) on AWS, not from ingress-nginx. |
 | **Self-hosted model size** | Start with the **same 3B model** as the home lab, so evaluation results are comparable; try a larger one on the GPU later. | The GPU (24 GB on a g6.xlarge) can run 7–8B models easily. |
@@ -88,12 +89,13 @@ Record each answer in the [decision log](#decision-log).
 ### Step 1.4: EKS cluster
 **Do:**
 - EKS cluster with a small **managed node group** (2 nodes, e.g. t3.medium) for Karpenter, CoreDNS and other system pods.
-- Add-ons: VPC CNI (with **network policy enforcement turned on**, so the NetworkPolicies from the home lab's step 6.3 work here too), CoreDNS, kube-proxy, **EBS CSI driver**, **Pod Identity agent**.
+- Add-ons: VPC CNI (with its own network policy enforcement **off**, since Cilium enforces policies), CoreDNS, kube-proxy, **EBS CSI driver**, **Pod Identity agent**.
+- **Cilium in chaining mode**, installed by Terraform's Helm provider right after the cluster and managed node group exist: `cni.chainingMode: aws-cni`, `cni.exclusive: false`, `enableIPv4Masquerade: false`, `routingMode: native`; Hubble and Hubble Relay on; ServiceMonitors **off** until monitoring exists (step 2.4); `lifecycle { ignore_changes }` so Argo CD manages it afterwards from `platform/cilium/overlays/aws`. Restart any pods that started before Cilium (e.g. CoreDNS) so Cilium manages them.
 - A Kubernetes version within **standard support**. EKS charges about six times more per hour for clusters on versions in extended support.
 - Access entries: your admin role, and the CI apply role.
 - Control plane logging: audit logs only, short retention (they're the useful ones and cost little).
 
-**Test:** `kubectl get nodes` shows the managed nodes; a gp3 PersistentVolumeClaim binds; tear down.
+**Test:** `kubectl get nodes` shows the managed nodes; `cilium status` is green and `cilium connectivity test` passes; a gp3 PersistentVolumeClaim binds; tear down.
 
 ### Step 1.5: Karpenter infrastructure
 **Do:** Karpenter's IAM (controller role via Pod Identity, node role and instance profile), the **interruption SQS queue** with EventBridge rules (spot interruption, rebalance, instance state change), and the Karpenter Helm release installed by Terraform (NodePools come from GitOps in step 2.3).
@@ -149,16 +151,17 @@ Record each answer in the [decision log](#decision-log).
 **Test:** a test Ingress creates an ALB and an `origin` DNS record; deleting it removes both.
 
 ### Step 2.3: Karpenter NodePools
-**Do:** `platform/karpenter/`: `EC2NodeClass` (AL2023, subnets and security groups by tag, encrypted gp3 root volume); **general NodePool** (spot + on-demand, several instance families, consolidation on, disruption budget); **GPU NodePool** (g6 family, spot preferred, label `workload=llm`, taint `dedicated=llm:NoSchedule`, consolidation off or limited so the model isn't moved needlessly).
+**Do:** `platform/karpenter/`: `EC2NodeClass` (AL2023, subnets and security groups by tag, encrypted gp3 root volume); **general NodePool** (spot + on-demand, several instance families, consolidation on, disruption budget); **GPU NodePool** (g6 family, spot preferred, label `workload=llm`, taint `dedicated=llm:NoSchedule`, consolidation off or limited so the model isn't moved needlessly). Both NodePools add the **startup taint** `node.cilium.io/agent-not-ready=true:NoExecute`, so no pod is scheduled on a new node until Cilium is running there.
 - **NVIDIA device plugin** (DaemonSet) so pods can request `nvidia.com/gpu`. (The AL2023 NVIDIA AMI includes the drivers.)
 
-**Test:** scaling a test Deployment up adds nodes, scaling down removes them; a pod requesting a GPU gets a g6 node from the GPU pool; simulate a spot interruption (e.g. AWS FIS or by hand) and watch Karpenter replace the node.
+**Test:** scaling a test Deployment up adds nodes, scaling down removes them; a pod requesting a GPU gets a g6 node from the GPU pool; new nodes only accept pods once Cilium is ready (the startup taint is removed); simulate a spot interruption (e.g. AWS FIS or by hand) and watch Karpenter replace the node.
 
 ### Step 2.4: Shared platform services on AWS
 **Do:** add `overlays/aws` for each shared component, changing only what AWS needs:
 - External Secrets: Pod Identity instead of the bootstrap key.
 - Monitoring: same stack; add CloudWatch metrics (ALB, RDS, ElastiCache) per the step 0.2 decision. Grafana is reached by `kubectl port-forward` only (there's no Cloudflare Access on this site). Alertmanager overlay: external labels `site=com`, `cluster=eks`; receivers for `#rl-com-alerts` and `#rl-critical`, plus the shared `#rl-security`, `#rl-mlops` and `#rl-costs` routes; the `Watchdog` heartbeat goes to its **own** heartbeat check, which is paused when the demo stack is down.
-- NetworkPolicies: the same policies from each component's `base/`, with AWS-specific allowances (e.g. WordPress → RDS and ElastiCache endpoints instead of in-cluster MariaDB and Valkey).
+- **CiliumNetworkPolicies:** the same cluster-wide baseline and per-component policies from each component's `base/` (home lab step 6.3), with AWS-specific destinations in `overlays/aws`: WordPress → the **RDS Proxy** and **ElastiCache** endpoints **by DNS name** instead of in-cluster MariaDB and Valkey; inbound to WordPress from the ALB (target-type `ip`, so traffic arrives from the VPC; allow the VPC's CIDR or the ALB's subnets); no cloudflared policy.
+- **Cilium and Hubble metrics:** the same `platform/cilium/` monitoring values as home (ServiceMonitors, Hubble metric set, dashboards, alert rules), now that the Prometheus Operator exists; Hubble UI by `kubectl port-forward`.
 - Kyverno: same policies; allow any AWS-provided system images (add exclusions for `kube-system` images published by AWS).
 - KEDA: Pod Identity for the SQS scaler.
 - Argo Rollouts: an `AnalysisTemplate` variant using **CloudWatch** (ALB 5xx rate and target response time) instead of ingress-nginx metrics.
@@ -215,7 +218,7 @@ Record each answer in the [decision log](#decision-log).
 ## Phase 5: Security and cost review
 
 ### Step 5.1: Security review
-**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
+**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
 
 **Test:** a written checklist in `docs/` with each item checked.
 

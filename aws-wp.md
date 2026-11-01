@@ -27,7 +27,9 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Summary queue | Its own SQS queue + dead-letter queue | Its own SQS queue + dead-letter queue |
 | Secrets | Its own Secrets Manager entries | Its own Secrets Manager entries |
 | Email | Amazon SES, its own domain identity (DKIM records in Route 53) | Amazon SES, its own domain identity (DKIM records in Cloudflare) |
-| Network policies | Enforced by the VPC CNI's network policy support | Enforced by Cilium (if chosen as the CNI; Talos's default Flannel doesn't enforce them) |
+| Networking (CNI) | **Cilium** in chaining mode with the Amazon VPC CNI | **Cilium** as the full CNI (replaces Flannel and kube-proxy) |
+| Network policies | **CiliumNetworkPolicies** (default-deny, DNS-name egress rules), enforced by Cilium | **CiliumNetworkPolicies**, same base policies |
+| Network visibility | Hubble + Hubble UI (port-forward), metrics in Prometheus | Hubble + Hubble UI (Cloudflare Access), metrics in Prometheus |
 | AWS resource tags | `Project=russetleaf`, `Site=com` | `Project=russetleaf`, `Site=dev` |
 | Self-hosted model | llama.cpp (CUDA build) on a Karpenter GPU node | llama.cpp (CPU build) on box 2 |
 | Bedrock | Same models through the gateway, with its own budget alert | Same models through the gateway, with its own budget alert |
@@ -130,7 +132,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
   - The LLM gateway may call `bedrock:InvokeModel` on the chosen Bedrock models only.
 - **No application database password on russetleaf.com:** WordPress logs in to RDS Proxy with IAM auth tokens; the master password is generated and rotated by RDS. At home, MariaDB Operator generates and rotates the passwords. See [Database access and credentials](#database-access-and-credentials).
 - Other secrets (API tokens, SMTP credentials, the Slack token) in **AWS Secrets Manager**, synced into the cluster by **External Secrets Operator**.
-- **NetworkPolicies**: default-deny in each application namespace, then only the connections each workload needs (e.g. only WordPress may reach the database). On EKS, turn on network policy enforcement in the VPC CNI add-on.
+- **CiliumNetworkPolicies** (Cilium on both clusters): default-deny in each application namespace, then only the connections each workload needs (e.g. only WordPress may reach the database), with outbound traffic to AWS allowed **by DNS name**; see [Networking: Cilium and Hubble](#networking-cilium-and-hubble).
 - RDS in **private subnets**, with **TLS required** on connections.
 - `DISALLOW_FILE_MODS` set to `true` (no plugin or theme installs from the admin screen).
 
@@ -148,7 +150,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 - **Falco** watches running containers (using its modern eBPF driver) and alerts on suspicious behaviour. Kyverno only checks resources when they're created; Falco covers what happens after. Custom rules for this design:
   - a **shell started** in a WordPress, summarizer or gateway pod, which normally never happens
   - **files written under `/var/www/html`**, since WordPress code is built into the image and `DISALLOW_FILE_MODS` is set
-  - **unexpected outbound connections** from the LLM nodes, which should only download model files
+  - **unexpected outbound connections** from the LLM nodes, which should only download model files (the CiliumNetworkPolicies also block these; Falco detects any attempt)
 - **Falcosidekick** sends Falco alerts to Alertmanager, Grafana and Slack (`#rl-security`). (On AWS, GuardDuty EKS Runtime Monitoring is the managed alternative; Falco runs the same on both clusters.)
 - **kube-bench** audits the cluster against the **CIS Kubernetes Benchmark**, run as a Job with the EKS profile. Reports are saved to `docs/` in `wp-gitops`.
 - **Trivy Operator** runs continuously in the cluster, producing CIS compliance reports, vulnerability reports for running images, and configuration audits.
@@ -181,6 +183,127 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 
 ### WordPress image and Helm chart
 The site uses a **custom image built on the official `wordpress` image** and a **small Helm chart of its own** (Deployment/Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob), both maintained in the `wp-image` repo and released together. The Bitnami WordPress chart isn't used: it only works with Bitnami-format images, and Bitnami cut back its free images in 2025. Owning the chart removes that dependency and keeps every setting visible.
+
+## Networking: Cilium and Hubble
+
+Both clusters run **Cilium**, so they share one networking story: the same policy types, the same network-flow visibility (**Hubble**), and the same Grafana dashboards and alerts.
+
+### How Cilium runs on each cluster
+
+| | Talos (russetleaf.dev) | EKS (russetleaf.com) |
+|---|---|---|
+| Mode | **Full CNI**: replaces Talos's default Flannel **and kube-proxy** | **Chaining mode** with the Amazon VPC CNI: the VPC CNI still gives pods their VPC IP addresses; Cilium adds policy enforcement and Hubble on top |
+| Key settings | Talos machine config `cluster.network.cni.name: none` and `cluster.proxy.disabled: true`; Cilium `kubeProxyReplacement: true`, `k8sServiceHost: localhost`, `k8sServicePort: 7445` (Talos's KubePrism API endpoint), plus Talos's documented cgroup and capability settings | `cni.chainingMode: aws-cni`, `cni.exclusive: false`, `enableIPv4Masquerade: false`, `routingMode: native`; the VPC CNI's own network policy enforcement stays **off**, so only one component enforces policies |
+| Installed by | Terraform (Helm provider) right after the cluster bootstraps, because nothing (including Argo CD) can run without a CNI; Argo CD then manages it from `platform/cilium/` | Terraform (Helm provider) right after the cluster and its managed node group are created; Argo CD then manages it |
+| New nodes | Fixed hardware | Karpenter NodePools add the startup taint `node.cilium.io/agent-not-ready=true:NoExecute`, so no pod lands on a new node before Cilium is ready on it |
+
+Terraform installs Cilium only once (later changes are ignored by Terraform, using `lifecycle { ignore_changes }`); from then on, the values in `wp-gitops/platform/cilium/` (with `overlays/home` and `overlays/aws`) are the source of truth, and Cilium upgrades go through Git like everything else.
+
+### Policies: CiliumNetworkPolicies, not plain NetworkPolicies
+
+The project uses **`CiliumClusterwideNetworkPolicy`** and **`CiliumNetworkPolicy`** resources instead of standard Kubernetes `NetworkPolicy`, because they can do three things standard policies can't:
+- **Filter outbound traffic by DNS name** (`toFQDNs`). AWS service IP addresses change constantly, so IP-based rules can't say "WordPress may reach S3". FQDN rules can.
+- **Use cluster-wide baselines**: one `CiliumClusterwideNetworkPolicy` sets **default-deny** for every application namespace and allows DNS to CoreDNS (with Cilium's DNS proxy turned on, which FQDN rules need).
+- **Filter at layer 7** (HTTP methods and paths) where it's worth it, e.g. the summarizer may only call WordPress's REST API.
+
+Each component's policies live in its `base/` (shared by both sites), with per-site differences in the overlays. A summary of the allowed traffic:
+
+| Workload | Allowed inbound | Allowed outbound |
+|---|---|---|
+| WordPress | From the ingress (ingress-nginx at home; the ALB on AWS), Prometheus | Database (MariaDB in-cluster / RDS Proxy endpoint), Valkey / ElastiCache, and by DNS name only: `*.s3.<region>.amazonaws.com`, `sqs.<region>.amazonaws.com`, `email-smtp.<region>.amazonaws.com`, `sts.<region>.amazonaws.com` |
+| Summarizer | Prometheus | WordPress REST API (layer 7: `GET`/`POST` on `/wp-json/*` only), the LiteLLM gateway, `sqs.<region>.amazonaws.com` |
+| LiteLLM gateway | Summarizer, staging summarizer, ARC runners (evaluation), Prometheus | llama.cpp, `bedrock-runtime.<region>.amazonaws.com` |
+| llama.cpp (LLM nodes) | LiteLLM gateway, Prometheus | The model mirror bucket's S3 endpoint only (init container); nothing else |
+| MariaDB (home) | WordPress, the backup Job, Prometheus | `*.s3.<region>.amazonaws.com` (backups) |
+| cloudflared (home) | — | Cloudflare's tunnel endpoints (by DNS name), ingress-nginx |
+
+Example (WordPress outbound, simplified):
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: wordpress-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: wordpress
+  egress:
+    - toEndpoints:                       # database and cache (home overlay; AWS uses toFQDNs for RDS Proxy/ElastiCache)
+        - matchLabels: {app.kubernetes.io/name: mariadb}
+        - matchLabels: {app.kubernetes.io/name: valkey}
+    - toFQDNs:                           # AWS APIs by name, not IP
+        - matchPattern: "*.s3.us-east-1.amazonaws.com"
+        - matchName: "sqs.us-east-1.amazonaws.com"
+        - matchName: "email-smtp.us-east-1.amazonaws.com"
+        - matchName: "sts.us-east-1.amazonaws.com"
+      toPorts:
+        - ports: [{port: "443", protocol: TCP}, {port: "587", protocol: TCP}]
+```
+
+**Guardrails:**
+- A **Kyverno generate rule** adds the default-deny baseline's per-namespace allowances when a new application namespace is created, so no namespace is ever left open.
+- Policies are tested in CI: rendered and schema-checked with the Cilium CRD schemas (kubeconform), and exercised in the ci kind cluster (which also runs Cilium).
+- Falco's "unexpected outbound connection" rule **detects**; the FQDN egress policies **prevent**. Each covers the other's gaps.
+
+### Hubble: network-flow visibility
+- **Hubble** (built into the Cilium agent), **Hubble Relay** (cluster-wide view) and **Hubble UI** are enabled on both clusters. Hubble UI is behind **Cloudflare Access** at home and reached by `kubectl port-forward` on EKS.
+- The `hubble` CLI shows live flows, e.g. `hubble observe --verdict DROPPED --namespace wordpress`, which is the first thing to run when a new policy blocks something it shouldn't.
+
+### Hubble and Cilium metrics in Prometheus
+Cilium Helm values (both clusters; the label set is kept small to protect box 1's memory):
+
+```yaml
+prometheus:
+  enabled: true                       # Cilium agent metrics
+  serviceMonitor:
+    enabled: true
+operator:
+  prometheus:
+    enabled: true                     # Cilium operator metrics
+    serviceMonitor:
+      enabled: true
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+  metrics:
+    enableOpenMetrics: true
+    enabled:
+      - dns
+      - drop
+      - tcp
+      - flow
+      - port-distribution
+      - "httpV2:exemplars=true;labelsContext=source_namespace,source_workload,destination_namespace,destination_workload,traffic_direction"
+    serviceMonitor:
+      enabled: true
+    dashboards:
+      enabled: true                   # Grafana dashboards as ConfigMaps, picked up by Grafana's sidecar
+      namespace: monitoring
+dashboards:
+  enabled: true                       # Cilium agent/operator dashboards
+  namespace: monitoring
+```
+
+What else is needed for this to work:
+- **Install order:** the ServiceMonitor resource type comes from the Prometheus Operator, which arrives after Cilium. Install the **`prometheus-operator-crds`** chart in the first Argo CD sync wave, and have Terraform's bootstrap install of Cilium keep its ServiceMonitors **off**; the Argo CD-managed Cilium values then turn them on.
+- **Prometheus must look in Cilium's namespace:** in kube-prometheus-stack, set `serviceMonitorSelectorNilUsesHelmValues: false` (and the same for PodMonitors and rules) so Prometheus picks up ServiceMonitors from every namespace, including `kube-system` where Cilium runs.
+- **Grafana must load the dashboards:** keep kube-prometheus-stack's Grafana dashboard sidecar watching all namespaces (or the `monitoring` namespace the dashboards are written to), with its default `grafana_dashboard: "1"` label.
+- **Layer-7 metrics** (`httpV2`) only appear for traffic that a layer-7 policy rule inspects (e.g. summarizer → WordPress REST API). That's intended: full HTTP visibility everywhere would cost memory box 1 doesn't have.
+
+**Alerts** (`PrometheusRule`s in `platform/cilium/`, with runbooks, routed by the usual `site` and `team` labels):
+
+| Alert | Fires when | Goes to |
+|---|---|---|
+| `CiliumAgentNotReady` | A node's Cilium agent is down or not ready | `#rl-critical` + site channel |
+| `HubblePolicyDropsSpike` | `hubble_drop_total{reason="POLICY_DENIED"}` rises sharply for a workload (a new policy blocking real traffic, or something probing) | `#rl-security` |
+| `CiliumEndpointRegenerationFailing` | Policy updates fail to apply to pods | Site channel |
+| `HubbleDNSErrors` | DNS errors (e.g. `NXDOMAIN`, `SERVFAIL`) rise, which often breaks FQDN rules | Site channel |
+
+**Memory:** the Cilium agent uses roughly 150–300 MB per node, the operator, Hubble Relay and Hubble UI about 200 MB together. On Talos this partly replaces Flannel and kube-proxy. Hubble UI can be scaled to zero when not in use.
 
 ## Database access and credentials
 
@@ -234,7 +357,7 @@ IAM authentication doesn't exist for a self-hosted MariaDB, so the home lab remo
 |---|---|
 | `wp-image` | The `db.php` drop-in (IAM token mode) and a chart setting **`database.auth: password | iam`** (default `password`), plus the RDS CA certificate bundle for TLS |
 | `wp-infra` | russetleaf.com: RDS Proxy (IAM required, TLS required), the `wordpress` secret and the proxy's role to read it, `manage_master_user_password`, `rds-db:connect` on the WordPress and seed-Job roles |
-| `wp-gitops` `overlays/aws` | `database.auth: iam`, the proxy endpoint, the `db-setup` PreSync Job, NetworkPolicy allowing WordPress → the proxy |
+| `wp-gitops` `overlays/aws` | `database.auth: iam`, the proxy endpoint, the `db-setup` PreSync Job, CiliumNetworkPolicy allowing WordPress → the proxy endpoint (by DNS name) |
 | `wp-gitops` `overlays/home`, `overlays/home-staging` | `database.auth: password`, pointing at the MariaDB Operator-generated Secret |
 | `wp-gitops` `base/` | Unchanged, except that **no database credential source lives in the base**: each overlay supplies its own |
 
@@ -587,7 +710,7 @@ The full AWS stack costs too much to run 24/7 as a portfolio project. Instead:
 
 Box 2 has about **6.5–7 GB** free for the model. A **3B model** (4-bit) is the best fit: about 2.5–3.5 GB of RAM, and roughly 1–2 minutes per summary on an i3 (depending on its generation and core count). That's fine for a queue handling 10–20 posts a month. A 7–8B model also fits (~5–5.5 GB) with better summaries, at about 3–6 minutes each and little memory to spare.
 
-Box 1 is the tight one: Talos, Argo CD, monitoring, WordPress and the platform services (Kyverno, KEDA, Falco, OpenCost, LiteLLM and others) come to roughly 6–7 GB of its 8 GB. To keep headroom:
+Box 1 is the tight one: Talos, Cilium and Hubble, Argo CD, monitoring, WordPress and the platform services (Kyverno, KEDA, Falco, OpenCost, LiteLLM and others) come to roughly 6–7 GB of its 8 GB. (Hubble UI can be scaled to zero when not in use.) To keep headroom:
 - Let the **ARC runners** tolerate box 2's taint, so evaluation jobs run next to the model (they mostly wait on it anyway).
 - Keep **Prometheus retention** short (e.g. 7 days) and scrape every 30–60 seconds rather than 15.
 - Set requests and limits on everything (Kyverno already requires them), so a busy pod can't starve the others.
@@ -672,7 +795,7 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Prompt evaluation | GitHub Actions on ARC runners in the cluster | Same | (included above) |
 | Progressive delivery | Argo Rollouts | Same | $0 |
 | Supply chain and policy | cosign, Syft, Trivy, Kyverno CLI in CI; Kyverno in the cluster | Same | $0 |
-| Network policies | Cilium (if chosen as the CNI) | VPC CNI network policy enforcement | $0 |
+| Networking and policies | Cilium (full CNI, no kube-proxy), CiliumNetworkPolicies, Hubble | Cilium (chaining with the VPC CNI), CiliumNetworkPolicies, Hubble | $0 |
 | Email | Amazon SES (russetleaf.dev identity) | Amazon SES (russetleaf.com identity) | <$1 |
 | Runtime security | Falco + Falcosidekick | Same (or GuardDuty EKS Runtime Monitoring) | $0 |
 | Compliance | Talos hardened defaults (documented) + Trivy Operator | kube-bench (EKS profile) + Trivy Operator | $0 |
@@ -706,6 +829,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **A four-repo GitOps structure:** infrastructure, deployment config, the WordPress image and the summarizer are separated by purpose and permissions, with automated, reviewed promotion of signed images and charts into the GitOps repo.
 - **LLM monitoring:** token, latency, error, fallback and cost metrics per model and prompt version, plus model-server throughput, in Prometheus and Grafana, with alerts.
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
+- **Zero-trust networking with Cilium on both clusters:** default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
 - **Supply-chain security and policy as code:** SBOMs, vulnerability scans and signed images in CI, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov on the Terraform.
 - **Runtime security and compliance:** Falco rules written for this application (shells in pods, writes to WordPress code, unexpected egress from LLM nodes), alerts in Grafana, CIS benchmark reports from kube-bench on EKS, and continuous Trivy Operator compliance reports on both clusters.
 - **Cost awareness (FinOps):** OpenCost shows cost per namespace and workload, including the GPU node and cost per summary, next to the Bedrock spend.
@@ -776,21 +900,25 @@ wp-gitops/
     seed-from-dev/          # one-off Job: load the latest russetleaf.dev backup + media into russetleaf.com
                             #   (aws only, manual sync)
   platform/                 # shared cluster services, each with base + overlays/home, overlays/aws
-    monitoring/             # kube-prometheus-stack, Grafana dashboards, alert rules (+ promtool tests),
+    monitoring/             # prometheus-operator-crds (first sync wave), kube-prometheus-stack (watching
+                            #   ServiceMonitors in all namespaces), Grafana dashboards, alert rules (+ promtool tests),
                             #   Alertmanager routing to Slack (receivers per site in the overlays)
     external-secrets/       # External Secrets Operator + AWS Secrets Manager store
     ingress/                # home: ingress-nginx; aws: AWS Load Balancer Controller
     external-dns/           # ExternalDNS, manages origin.russetleaf.com in Route 53 (aws only)
     cloudflared/            # Cloudflare Tunnel connector (home only)
     storage/                # home: local-path-provisioner or Longhorn; aws: EBS CSI StorageClass
-    cilium/                 # Cilium CNI with NetworkPolicy enforcement (home only, if chosen; EKS uses the VPC CNI)
+    cilium/                 # Cilium + Hubble (home: full CNI; aws: chaining with the VPC CNI), cluster-wide
+                            #   default-deny CiliumClusterwideNetworkPolicy, Cilium/Hubble ServiceMonitors,
+                            #   dashboards and alert rules
     nvidia-device-plugin/   # exposes GPUs to pods (aws only)
     mariadb/                # MariaDB Operator + database + scheduled Backup to S3 (home only; RDS on AWS)
     valkey/                 # Valkey object cache (home only; ElastiCache on AWS)
     keda/                   # KEDA operator (event-driven autoscaling)
     argo-rollouts/          # Argo Rollouts controller (canary releases)
     kyverno/                # Kyverno + policies (signed images, no :latest, resource limits,
-                            #   no privileged pods) + policy tests + Policy Reporter (violations to Slack)
+                            #   no privileged pods) + a generate rule adding default-deny Cilium policies to new
+                            #   app namespaces + policy tests + Policy Reporter (violations to Slack)
     falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
@@ -808,7 +936,7 @@ wp-gitops/
 ```
 
 - **App of apps:** each cluster gets one root Argo CD Application (`bootstrap/home` or `bootstrap/aws`) that points at the overlays for that environment. Argo CD then creates an Application for every app and platform service.
-- **Sync order:** use Argo CD **sync waves** so operators and CRDs come up before the things that need them: storage, External Secrets and Kyverno first, then monitoring, KEDA, Argo Rollouts and the gateway, then WordPress and the summarizer. Start Kyverno policies in **audit mode** and switch them to enforce once everything passes.
+- **Sync order:** use Argo CD **sync waves** so operators and CRDs come up before the things that need them: Cilium (adopted from Terraform's bootstrap install) and the `prometheus-operator-crds` chart first, then storage, External Secrets and Kyverno, then monitoring, KEDA, Argo Rollouts and the gateway, then WordPress and the summarizer. Start Kyverno policies in **audit mode** and switch them to enforce once everything passes.
 - **What's in `platform/` vs `apps/`:** `platform/` holds cluster services the applications depend on; `apps/` holds the applications themselves. Components marked "home only" exist only in the home overlays because AWS supplies a managed service in their place. Components marked "aws only" exist only in the AWS overlays because they don't apply to fixed home hardware or to Talos.
 - **Which model runs in production** is decided here, in `platform/llm-gateway/`. **Whether a model is good enough** is decided by the evaluation in `llm-summarizer`. A routing change should link to the evaluation report that justifies it.
 
@@ -862,7 +990,7 @@ wp-image/
   db.php                    # database drop-in: IAM auth token mode (database.auth: iam) or plain password
   plugins.json              # pinned plugin and theme versions (offload media, Redis object cache, SMTP, ...)
   chart/                    # the WordPress Helm chart: Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob,
-                            #   NetworkPolicy
+                            #   CiliumNetworkPolicy (per-site destinations set in values)
   mu-plugins/
     summary-queue/          # sends post IDs to SQS when a post is published or updated
   tests/                    # smoke test: the container starts, plugins are active, health check passes
