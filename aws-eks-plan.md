@@ -131,7 +131,7 @@ Record each answer in the [decision log](#decision-log).
 **Test:** Argo CD lists the AWS root app (it will show missing components until Phase 2), and its first sync appears in `#rl-deploys`.
 
 ### Step 1.9: `wp-infra` CI for AWS
-**Do:** extend CI to plan `envs/aws-edge` and `envs/aws` on pull requests, and run **`terraform test`** (with mocked providers where possible) for the AWS-specific modules (`alerting`, the CloudFront edge, RDS restore logic). Applies are done by the demo workflows (Phase 6) or locally, never automatically on merge, so merging never starts a paid stack.
+**Do:** extend CI to plan `envs/aws-edge` and `envs/aws` on pull requests, run **Checkov** on the source and plans of both AWS environments (with results in GitHub code scanning, as for the home environment), and run **`terraform test`** (with mocked providers where possible) for the AWS-specific modules (`alerting`, the CloudFront edge, RDS restore logic). Applies are done by the demo workflows (Phase 6) or locally, never automatically on merge, so merging never starts a paid stack.
 
 **Test:** a pull request shows plans for all three environments, and `terraform test` passes (and fails on a deliberately broken module input).
 

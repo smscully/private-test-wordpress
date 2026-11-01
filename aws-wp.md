@@ -163,7 +163,25 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 **Rollout:** every policy starts in **audit mode**; Policy Reporter's findings go to `#rl-security`; fix or add a justified exception for each; then switch to **enforce**.
 
 - The **Kyverno CLI** (`kyverno test` and `kyverno apply`) runs the same policies in `wp-gitops` CI against every manifest change, so violations fail the pull request before Argo CD ever deploys them. This covers the "policy checks before deploy" role often given to OPA, without a second policy engine.
-- **Checkov** (in `wp-infra` CI) checks the Terraform for insecure settings before anything is applied.
+- **Checkov** scans infrastructure and configuration code in **all four repos'** CI (see below), so insecure settings fail the pull request before anything is applied, built or deployed.
+
+### Infrastructure and configuration scanning (Checkov)
+**Checkov** (free, open source, no account needed) is the project's scanner for infrastructure-as-code and configuration. Snyk isn't used: it's a commercial platform whose free tier limits monthly scans, and it would overlap with Checkov (configuration) and Trivy (images and dependencies) without adding coverage.
+
+| Repo | What Checkov scans |
+|---|---|
+| `wp-infra` | **Terraform** source, plus the **plan** (`terraform show -json` output), which catches problems that only appear once variables and modules are resolved |
+| `wp-gitops` | The **rendered Kubernetes manifests** for every overlay (the output of Helm and Kustomize, i.e. exactly what Argo CD would apply), and the Helm values |
+| `wp-image` | The **Dockerfile**, the WordPress **Helm chart** |
+| `llm-summarizer` | The **Dockerfile**, the summarizer **Helm chart** |
+| All four | **GitHub Actions workflows**: actions not pinned to a commit, over-broad `permissions`, untrusted input used in scripts (script injection) |
+
+How it's run:
+- **Same version everywhere:** pinned in each repo's `.mise.toml` (installed with `uv`), so local runs and CI match.
+- **Fails the pull request** on any failed check that hasn't been explicitly skipped. Skips are written inline (`checkov:skip=<check ID>: <reason>`) or in the repo's `.checkov.yaml`, **always with a reason**, and reviewed like any other change.
+- **Results on GitHub:** findings are uploaded as **SARIF** to GitHub's **code scanning**, so they appear inline on pull requests and in each repo's Security tab. Code scanning is free for **public** repos; while the repos are private (without GitHub Advanced Security), Checkov's results show in the CI log and job summary instead, and SARIF upload is switched on when each repo goes public.
+- **Overlap with Kyverno is intended:** Checkov checks manifests *before* they're merged, using its own rule set; Kyverno enforces the project's policies *at admission* in the cluster (and its CLI tests the same policies in CI).
+
 
 ### Runtime security and compliance
 - **Falco** watches running containers (using its modern eBPF driver) and alerts on suspicious behaviour. Kyverno only checks resources when they're created; Falco covers what happens after. Custom rules for this design:
@@ -950,7 +968,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
 - **Architecture decision records:** documented choices with their trade-offs, e.g. why media is on S3 rather than the commonly recommended EFS, and why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
 - **Zero-trust networking with Cilium on both clusters:** WireGuard encryption between nodes, default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
-- **Supply-chain security and policy as code:** SBOMs, vulnerability scans and signed images in CI, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov on the Terraform.
+- **Supply-chain security and policy as code:** SBOMs, vulnerability scans and signed images in CI, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov scanning Terraform, rendered manifests, Helm charts, Dockerfiles and GitHub Actions workflows in all four repos, with results in GitHub code scanning.
 - **Runtime security and compliance:** Falco rules written for this application (shells in pods, writes to WordPress code, unexpected egress from LLM nodes), alerts in Grafana, CIS benchmark reports from kube-bench on EKS, and continuous Trivy Operator compliance reports on both clusters.
 - **Cost awareness (FinOps):** OpenCost shows cost per namespace and workload, including the GPU node and cost per summary, next to the Bedrock spend.
 - **EKS node autoscaling with Karpenter:** general and GPU NodePools, spot with interruption handling, and consolidation, with a documented reason it doesn't apply to fixed home hardware.
@@ -1098,7 +1116,7 @@ wp-infra/
                             #   (media, database-backup and model mirror buckets, SQS, Secrets Manager,
                             #   SES identity, Bedrock IAM), plus a second, smaller set of the same modules
                             #   for staging (Env=staging)
-  .github/workflows/        # fmt, validate, tflint, Checkov, `terraform test` (modules) and plan on every pull
+  .github/workflows/        # fmt, validate, tflint, Checkov (source + plan, SARIF), `terraform test` (modules) and plan on every pull
                             #   request (plan posted as a comment); apply on merge to main, with approval
 ```
 

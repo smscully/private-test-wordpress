@@ -161,10 +161,11 @@ Record each answer in the [decision log](#decision-log).
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
 - In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and two ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4) and `0002-s3-media-not-efs.md` (finish in step 5.1); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
+- Add **Checkov** to every repo's CI from the start, scanning the **GitHub Actions workflows** (unpinned actions, over-broad `permissions`, script injection), with a `.checkov.yaml` per repo. Later steps add each repo's other targets (Terraform, manifests, Dockerfiles, charts). Skips must carry a reason. See [Infrastructure and configuration scanning](aws-wp.md#infrastructure-and-configuration-scanning-checkov).
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
 - In `wp-gitops`: move `aws-wp.md` and this file to `docs/`, and write the hub README (what the project is, links to all four repos).
 
-**Test:** each repo has protected `main`, the secret scan runs on a test pull request, and Renovate opens its onboarding pull request.
+**Test:** each repo has protected `main`, the secret scan and Checkov run on a test pull request (a workflow with `permissions: write-all` fails Checkov), and Renovate opens its onboarding pull request.
 
 ## Phase 2: Infrastructure (`wp-infra`)
 
@@ -201,7 +202,7 @@ Record each answer in the [decision log](#decision-log).
 **Test:** with each scoped key, the allowed action works and a disallowed one fails (e.g. the WordPress key can't read the backup bucket); `aws bedrock-runtime converse` with the LiteLLM key returns a response; the tunnel shows as created in Cloudflare.
 
 ### Step 2.4: `wp-infra` CI
-**Do:** GitHub Actions: `terraform fmt -check`, `validate`, `tflint`, Checkov, and `plan` on pull requests (plan posted as a comment). Applies to `envs/home` stay **local** for now (the Talos provider needs your home network); they can move to in-cluster runners after step 9.2.
+**Do:** GitHub Actions: `terraform fmt -check`, `validate`, `tflint`, **Checkov on the Terraform source and on the plan** (`terraform show -json` output), and `plan` on pull requests (plan posted as a comment). Applies to `envs/home` stay **local** for now (the Talos provider needs your home network); they can move to in-cluster runners after step 9.2.
 
 **Test:** a pull request with a harmless change shows a passing check run and a plan comment; a deliberately insecure change (e.g. a public bucket) fails Checkov.
 
@@ -214,7 +215,7 @@ Record each answer in the [decision log](#decision-log).
 - `bootstrap/home/`: the root "app of apps" that creates one Argo CD Application per component, with **sync waves** (Cilium and the `prometheus-operator-crds` chart first, then storage and secrets, then ingress, monitoring, operators, then apps).
 - Expose the Argo CD UI only through Cloudflare Access (after step 4.3), or use `kubectl port-forward` until then.
 - **Argo CD Notifications** to `#rl-deploys` (sync succeeded, sync failed, app degraded), using the Slack bot token. Until External Secrets exists (step 4.2), create the token Secret by hand; switch it to an `ExternalSecret` afterwards.
-- CI: render every component's home overlay (Helm/Kustomize) and validate with `kubeconform`.
+- CI: render every component's home overlay (Helm/Kustomize), validate with `kubeconform`, and run **Checkov on the rendered manifests** (what Argo CD would actually apply).
 
 **Test:** apply the root app; Argo CD shows it `Synced`/`Healthy` with a trivial test component; a sync posts to `#rl-deploys`; a pull request that breaks a manifest fails CI.
 
@@ -280,7 +281,7 @@ Check `kubectl top nodes` after each step.
 - The **summary-queue must-use plugin**: on publish or update, send `{"post_id": ...}` to SQS (AWS SDK for PHP, installed with Composer at build time).
 - `tests/`: a smoke test (Docker Compose with MariaDB: the container starts, plugins are active, health check passes).
 - `chart/`: the WordPress Helm chart (see step 5.2 for what it deploys), versioned with the image.
-- CI: build, SBOM (Syft), scan (Trivy, failing on critical vulnerabilities), sign (cosign keyless), push the image and the chart (OCI) to GHCR with an immutable version.
+- CI: **Checkov on the Dockerfile and the chart**, build, SBOM (Syft), scan (Trivy, failing on critical vulnerabilities), sign (cosign keyless), push the image and the chart (OCI) to GHCR with an immutable version.
 
 **Test:** the smoke test passes locally and in CI; `cosign verify` succeeds for the pushed image; publishing a post in the local Compose setup sends a message to the real SQS queue.
 
@@ -404,6 +405,7 @@ Review the policy reports, fix violations, then switch to **enforce**.
 **Do:**
 - `chart/`: Deployment (Rollout later), KEDA `ScaledObject` on the SQS queue (0–N), daily sweep CronJob, ServiceAccount, resources.
 - `ci/`: kind end-to-end tests on GitHub-hosted runners, with the AWS stand-ins (SQS) and a **mock LLM** (LiteLLM with mock responses): a queued post gets a summary written back to a test WordPress; a failing message reaches the dead-letter queue.
+- **Checkov on the summarizer's Dockerfile and chart** in pull request CI.
 - Release workflow: build, SBOM, scan, sign, push the image and the chart (OCI) to GHCR, open a chart-bump pull request on `wp-gitops` for **`overlays/home-staging`** (promoted to prod by the step 5.7 pipeline).
 - `wp-gitops/apps/post-summarizer/overlays/home` and `overlays/home-staging`: queue URL, gateway URL (staging uses its own LiteLLM key and budget), WordPress URL, credentials from External Secrets.
 - Turn on the summarizer check in the staging smoke tests (step 5.6).
@@ -481,7 +483,7 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 **Test:** each pod works with no AWS key in its Secrets; the old keys are deleted from IAM.
 
 ### Step 11.2: Documentation and polish
-**Do:** hub README with the russetleaf.dev architecture diagram and links to all repos; screenshots of Grafana (site, LLM, cost), Argo CD and an evaluation report; update `aws-wp.md` wherever the build differed from the design; check every repo with `gitleaks`, then make them public.
+**Do:** hub README with the russetleaf.dev architecture diagram and links to all repos; screenshots of Grafana (site, LLM, cost), Argo CD and an evaluation report; update `aws-wp.md` wherever the build differed from the design; check every repo with `gitleaks`, then make them public, and switch on **SARIF upload** of Checkov's results to GitHub code scanning in each (free for public repos), so findings appear on pull requests and in the Security tab.
 
 **Test:** someone unfamiliar with the project can follow the README to understand it in five minutes.
 
