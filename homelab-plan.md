@@ -143,7 +143,7 @@ Record each answer in the [decision log](#decision-log).
 | Decision | Recommendation | Why it matters |
 |---|---|---|
 | **WordPress Helm chart** | Write a **small chart of your own** (Deployment/Rollout, Service, Ingress, HPA, PDB, CronJob for WP-Cron), kept in `wp-image/chart/` and released together with the image, for an image built on the **official `wordpress` image**. (`aws-wp.md` already assumes this.) | The Bitnami chart only works with Bitnami-format images (their startup scripts and environment variables). Since Bitnami cut back its free images in 2025, the alternatives are building Bitnami's image yourself from their open-source `bitnami/containers` repo, or your own chart. Your own chart is simpler to reason about, removes the Bitnami dependency, and is a portfolio piece. |
-| **Container registry** | **GHCR** (GitHub Container Registry): free for public images, and cosign keyless signing works with GitHub Actions out of the box. | Kyverno policies and image references depend on it. |
+| **Container registry** | **GHCR** (GitHub Container Registry): free for public images, and cosign keyless signing works with GitHub Actions out of the box. Note that **GHCR packages have their own visibility, separate from the repo's**, and start private. | Kyverno policies and image references depend on it. |
 | **Repos public or private** | Private while building; make public once each repo has been scanned for secrets (`gitleaks`). | Self-hosted runners on public repos need extra care (step 9.2). |
 | **Summarizer language** | **Python** (boto3 for SQS, the `openai` client for the gateway, OpenTelemetry SDK). | Fastest path; the most common language for MLOps work. |
 | **Existing Talos node** | **Rebuild it with Terraform** in step 2.2, rather than adopting the hand-built config. | Nothing on the cluster is worth keeping, and a Terraform-built cluster is reproducible. Adopting it means importing its existing machine secrets, which is fiddly. |
@@ -284,7 +284,9 @@ Check `kubectl top nodes` after each step.
 - `chart/`: the WordPress Helm chart (see step 5.2 for what it deploys), versioned with the image.
 - CI: **Checkov on the Dockerfile and the chart**, build, SBOM (Syft), scan (Trivy, failing on critical vulnerabilities), sign (cosign keyless), push the image and the chart (OCI) to GHCR with an immutable version.
 
-**Test:** the smoke test passes locally and in CI; `cosign verify` succeeds for the pushed image; publishing a post in the local Compose setup sends a message to the real SQS queue.
+- **Pulling private packages:** GHCR packages start **private** (even in a public repo), so until they're made public (step 11.2), the cluster needs credentials. Create a GitHub token with **`read:packages` only**, store it in Secrets Manager, and sync it with External Secrets into an **image pull secret** for the WordPress namespace (and, from step 7.4, the summarizer's), and into Argo CD's **OCI repository credentials** so it can pull the charts.
+
+**Test:** the smoke test passes locally and in CI; `cosign verify` succeeds for the pushed image; the cluster can pull the private image and Argo CD can pull the private chart; publishing a post in the local Compose setup sends a message to the real SQS queue.
 
 ### Step 5.2: WordPress chart and deployment (`wp-gitops/apps/wordpress/`)
 **Do:**
@@ -484,7 +486,7 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 **Test:** each pod works with no AWS key in its Secrets; the old keys are deleted from IAM.
 
 ### Step 11.2: Documentation and polish
-**Do:** hub README with the russetleaf.dev architecture diagram and links to all repos; screenshots of Grafana (site, LLM, cost), Argo CD and an evaluation report; update `aws-wp.md` wherever the build differed from the design; check every repo with `gitleaks`, then make them public, and switch on **SARIF upload** of Checkov's results to GitHub code scanning in each (free for public repos), so findings appear on pull requests and in the Security tab.
+**Do:** hub README with the russetleaf.dev architecture diagram and links to all repos; screenshots of Grafana (site, LLM, cost), Argo CD and an evaluation report; update `aws-wp.md` wherever the build differed from the design; check every repo with `gitleaks`, then make them public; **also make each GHCR package public** in its package settings (a repo going public doesn't change its packages), then remove the image pull secrets and Argo CD's GHCR credentials and confirm everything still pulls; and switch on **SARIF upload** of Checkov's results to GitHub code scanning in each (free for public repos), so findings appear on pull requests and in the Security tab.
 
 **Test:** someone unfamiliar with the project can follow the README to understand it in five minutes.
 

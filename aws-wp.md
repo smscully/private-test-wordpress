@@ -249,6 +249,8 @@ Whichever is chosen must also work with a **custom S3 endpoint**, so the ci test
 ### WordPress image and Helm chart
 The site uses a **custom image built on the official `wordpress` image** and a **small Helm chart of its own** (Deployment/Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob), both maintained in the `wp-image` repo and released together. The Bitnami WordPress chart isn't used: it only works with Bitnami-format images, and Bitnami cut back its free images in 2025. Owning the chart removes that dependency and keeps every setting visible.
 
+**Where images and charts are hosted:** on **GitHub Container Registry (GHCR)** under the project's GitHub account: `ghcr.io/<github-user>/wp-image` and `ghcr.io/<github-user>/llm-summarizer`, each holding its image and its Helm chart (as an OCI artifact). Each package is linked to the repo whose CI publishes it. **GHCR packages have their own visibility setting, separate from the repo's:** a package stays **private** even after its repo is made public, until its visibility is changed in the package's settings. While packages are private, both clusters need credentials to pull them: an image pull secret for the kubelet, and OCI repository credentials for Argo CD (both from a GitHub token with `read:packages` only, kept in Secrets Manager and synced by External Secrets). Once the packages are public, both can be removed.
+
 ## Networking: Cilium and Hubble
 
 Both clusters run **Cilium**, so they share one networking story: the same policy types, the same network-flow visibility (**Hubble**), and the same Grafana dashboards and alerts.
@@ -1212,7 +1214,7 @@ The self-hosted model isn't a special case: its deployment is ordinary platform 
 | `wp-infra` CI | AWS through GitHub OIDC: read-only *plan* role on pull requests, *apply* role on `main`; Cloudflare API token |
 | `wp-image` CI | Push to the image registry; cosign keyless signing (GitHub OIDC); pull requests on `wp-gitops` via the bot |
 | `llm-summarizer` CI | Push images and charts; cosign keyless signing; pull requests on `wp-gitops` via the bot; evaluation runs on in-cluster ARC runners, which call Bedrock through the gateway |
-| Argo CD (both clusters) | Read `wp-gitops` and pull charts and images (public repos and registries need no credentials) |
+| Argo CD (both clusters) | Read `wp-gitops` and pull charts and images (public repos and public GHCR packages need no credentials; GHCR packages are private by default, even in public repos, so make them public separately or provide credentials) |
 | `staging-test` workflow (ARC runners) | An Argo CD account limited to the staging project (sync and delete staging Applications only); posts to `#rl-staging` |
 | Kyverno | Admits only images signed by the `wp-image` and `llm-summarizer` release workflows (cosign keyless: GitHub OIDC issuer `https://token.actions.githubusercontent.com`, subject matching each repo's release workflow on `main` or a tag) |
 
