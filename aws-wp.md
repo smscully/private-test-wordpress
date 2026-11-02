@@ -249,7 +249,7 @@ Whichever is chosen must also work with a **custom S3 endpoint**, so the ci test
 ### WordPress image and Helm chart
 The site uses a **custom image built on the official `wordpress` image** and a **small Helm chart of its own** (Deployment/Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob), both maintained in the `wp-image` repo and released together. The Bitnami WordPress chart isn't used: it only works with Bitnami-format images, and Bitnami cut back its free images in 2025. Owning the chart removes that dependency and keeps every setting visible.
 
-**Where images and charts are hosted:** on **GitHub Container Registry (GHCR)** under the project's GitHub account: `ghcr.io/<github-user>/wp-image` and `ghcr.io/<github-user>/llm-summarizer`, each holding its image and its Helm chart (as an OCI artifact). Each package is linked to the repo whose CI publishes it. **GHCR packages have their own visibility setting, separate from the repo's:** a package stays **private** even after its repo is made public, until its visibility is changed in the package's settings. While packages are private, both clusters need credentials to pull them: an image pull secret for the kubelet, and OCI repository credentials for Argo CD (both from a GitHub token with `read:packages` only, kept in Secrets Manager and synced by External Secrets). Once the packages are public, both can be removed.
+**Where images and charts are hosted:** on **GitHub Container Registry (GHCR)** under the project's GitHub account: `ghcr.io/<github-user>/wp-image` and `ghcr.io/<github-user>/llm-summarizer`, each holding its image and its Helm chart (as an OCI artifact). Each package is linked to the repo whose CI publishes it. **GHCR packages have their own visibility setting, separate from the repo's:** a package stays **private** even after its repo is made public, until its visibility is changed in the package's settings. While packages are private, both clusters need credentials to pull them: an image pull secret for the kubelet, and OCI repository credentials for Argo CD (both from a GitHub token with `read:packages` only, kept in Secrets Manager and synced by External Secrets). Once the packages are public, both can be removed. While packages are private, GitHub's free-plan limits for private packages apply (roughly 500 MB of storage and limited transfer), so either make the packages public early or delete old untagged versions automatically. Why GHCR rather than ECR is recorded in `docs/adr/0004-ghcr-not-ecr.md`.
 
 ## Networking: Cilium and Hubble
 
@@ -1026,7 +1026,8 @@ wp-gitops/
     aws-eks-plan.md         # build plan for russetleaf.com
     runbooks/               # one page per alert: what it means, how to check, how to fix
     adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md,
-                            #   0002-s3-media-not-efs.md, 0003-kubescape-cli-not-operator.md)
+                            #   0002-s3-media-not-efs.md, 0003-kubescape-cli-not-operator.md,
+                            #   0004-ghcr-not-ecr.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
