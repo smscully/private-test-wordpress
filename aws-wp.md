@@ -31,6 +31,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Network policies | **CiliumNetworkPolicies** (default-deny, DNS-name egress rules), enforced by Cilium | **CiliumNetworkPolicies**, same base policies |
 | Encryption in transit | TLS on sensitive connections; Cilium WireGuard between nodes, if supported in chaining mode | TLS on sensitive connections; Cilium WireGuard between nodes |
 | Service mesh | None, by decision (ADR) | None, by decision (ADR) |
+| Logs | Loki + Alloy, 14-day retention (bucket in the always-on edge stack); control-plane audit logs in CloudWatch | Loki + Alloy, 7-day retention, including Talos system logs |
 | Network visibility | Hubble + Hubble UI (port-forward), metrics in Prometheus | Hubble + Hubble UI (Cloudflare Access), metrics in Prometheus |
 | AWS resource tags | `Project=russetleaf`, `Site=com` | `Project=russetleaf`, `Site=dev` |
 | Self-hosted model | llama.cpp (CUDA build) on a Karpenter GPU node | llama.cpp (CPU build) on box 2 |
@@ -243,7 +244,7 @@ Whichever is chosen must also work with a **custom S3 endpoint**, so the ci test
   - **spot interruption handling** through an SQS queue fed by EventBridge, so pods move before AWS reclaims a spot node
 - **Cost visibility** with **OpenCost** (or the free Kubecost EKS bundle, which reads AWS billing data): cost per namespace, workload and node, including the GPU node's share and cost per summary alongside the Bedrock spend.
 - **Progressive delivery** with **Argo Rollouts**: new WordPress and summarizer versions go out as canaries (e.g. 10% → 50% → 100%). An analysis step checks Prometheus metrics (error rate, latency) at each stage and **rolls back automatically** if they get worse. The metrics come from **CloudWatch** on AWS (ALB 5xx rate and response time, through Argo Rollouts' CloudWatch provider) and from **ingress-nginx's Prometheus metrics** at home.
-- **Metrics, logs and alerts**: Prometheus, Grafana and Alertmanager (or CloudWatch Container Insights), including the LLM metrics described below, with every alert routed to **Slack** by site and topic; see [Alerting and notifications](#alerting-and-notifications-slack).
+- **Metrics, logs and alerts**: Prometheus, **Loki** (logs, collected by Grafana Alloy; see [Logging](#logging-loki--alloy)), Grafana and Alertmanager, including the LLM metrics described below, with every alert routed to **Slack** by site and topic; see [Alerting and notifications](#alerting-and-notifications-slack).
 - **Deployment notifications**: Argo CD and Argo Rollouts post syncs, failures, canary steps and rollbacks to `#rl-deploys`.
 - **AWS Budgets alerts**, including one on Bedrock spending, in case a bug calls the model in a loop.
 - **Tagging**: every AWS resource gets `Project`, `Site`, `Env` and `ManagedBy` tags (plus `Stack=edge|demo` on russetleaf.com) through the AWS provider's `default_tags`, so leftovers can be found and costs split per site.
@@ -560,6 +561,41 @@ OpenTelemetry's PHP auto-instrumentation (a PHP extension plus SDK, added to the
 ### Cost and memory
 $0. The exporters are small (roughly 20–50 MB each); the custom plugin adds nothing measurable. Only the optional Tempo tracing is expensive.
 
+## Logging (Loki + Alloy)
+
+Both sites send all logs to **Grafana Loki**, collected by **Grafana Alloy**, so logs survive pod restarts, evictions and deleted staging runs, and can be searched in Grafana next to the metrics. The reasoning is recorded in `docs/adr/0005-loki-alloy-for-logs.md`.
+
+### Components
+
+| Piece | What it does | Configuration |
+|---|---|---|
+| **Loki** (single-binary mode) | Stores and indexes logs; queried from Grafana | Index and log data in an **S3 bucket** per site (lifecycle rules matching retention), a small local cache volume; **7-day retention** at home, **14 days** for russetleaf.com (its bucket is in the always-on edge stack, so demo logs can be reviewed afterwards); multi-tenancy off |
+| **Grafana Alloy** (DaemonSet, one per node) | Collects every container's logs and sends them to Loki | Adds a **small, fixed label set**: `site`, `env`, `cluster`, `namespace`, `app`, `container`. Everything else (pod name, request IDs) stays in the log line or as structured metadata, because Loki's cost grows with the number of label combinations. Drops noisy debug lines and health-check access logs before sending. Masks obvious secrets (tokens, passwords in query strings) |
+| **Talos system logs** (home) | Kubelet, etcd and Talos service logs from the nodes themselves | Talos's machine logging setting sends them as JSON to Alloy on each node (a host port), so node-level problems are searchable too |
+| **EKS control plane** (AWS) | API server audit logs | Stay in **CloudWatch Logs** (short retention), as planned; not duplicated into Loki |
+| **Log-based alerts** | Alerts on log patterns that metrics can't see | Loki's **ruler** evaluates log queries and sends alerts to the same **Alertmanager → Slack** routing (by `site`, `env` and `team`) |
+| **Grafana correlation** | From a metric spike to that pod's logs for the same time window (and to its traces, if Tempo is on) | Loki added as a Grafana data source, with links between dashboards, logs and traces |
+
+Alloy needs to read log files on each node and listen on a host port for Talos's logs, so it gets a narrow **Kyverno `PolicyException`** (host paths and the host port only), like the other node-level agents.
+
+### Log-based alerts (examples)
+
+| Alert | Fires when | Goes to |
+|---|---|---|
+| `WordPressPHPFatalErrors` | PHP fatal errors appear in WordPress logs more than a few times in 5 minutes | Site channel |
+| `SummarizerExceptions` | The summarizer logs repeated unhandled exceptions | `#rl-mlops` |
+| `BedrockThrottling` | The gateway logs Bedrock throttling or quota errors | `#rl-mlops` |
+| `LokiIngestionErrors` | Alloy can't deliver logs to Loki | Site channel |
+
+Each has a runbook in `docs/runbooks/` and a test of its log query.
+
+### Privacy
+Logs can contain visitors' IP addresses and occasionally email addresses. Short retention (7 and 14 days), masking in Alloy, and access to Grafana only through Cloudflare Access (home) or port-forward (AWS) keep that in check. Staging logs come from scrubbed data.
+
+### Cost and memory
+- **Money:** a few cents a month per site for the S3 buckets.
+- **Memory:** Loki in single-binary mode is roughly 200–500 MB, Alloy about 100–200 MB per node. On box 1 that's tight; keep retention short, drop noise at the collector and keep labels few. Recorded in the box 1 memory budget.
+
 ## Alerting and notifications (Slack)
 
 Every alert and operational event from both sites goes to **Slack**, routed by **site** and **topic**, so problems reach a person instead of sitting in a dashboard.
@@ -772,6 +808,7 @@ These are approximate prices for **us-east-1**, on demand unless noted, for a sm
 | Amazon Bedrock | ~10–20 new or edited posts/month plus CI evaluation runs, on Haiku and Nova (~$1 per 1M input tokens, ~$5 per 1M output for Haiku; Nova less) | ~$1–$2 |
 | LiteLLM, ARC runners, KEDA, Argo Rollouts, Kyverno, Falco, Trivy Operator, OpenCost, Karpenter, Prometheus/Grafana | run on the existing worker nodes | $0 |
 | kube-bench | Job run on demand | $0 |
+| Loki log storage (S3) | 14-day retention, demo-hours volume | <$1 |
 | Alerting (SNS, Amazon Q Developer in chat applications, Slack free plan) | CloudWatch alarms and budget alerts to Slack | $0 |
 | **Total** | | **~$720–$820 / month** |
 
@@ -852,7 +889,7 @@ The full AWS stack costs too much to run 24/7 as a portfolio project. Instead:
 
 Box 2 has about **6.5–7 GB** free for the model. A **3B model** (4-bit) is the best fit: about 2.5–3.5 GB of RAM, and roughly 1–2 minutes per summary on an i3 (depending on its generation and core count). That's fine for a queue handling 10–20 posts a month. A 7–8B model also fits (~5–5.5 GB) with better summaries, at about 3–6 minutes each and little memory to spare.
 
-Box 1 is the tight one: Talos, Cilium and Hubble, Argo CD, monitoring, WordPress and the platform services (Kyverno, KEDA, Falco, OpenCost, LiteLLM and others) come to roughly 6–7 GB of its 8 GB. (Hubble UI can be scaled to zero when not in use.) To keep headroom:
+Box 1 is the tight one: Talos, Cilium and Hubble, Argo CD, monitoring and logging (Prometheus, Loki, Alloy), WordPress and the platform services (Kyverno, KEDA, Falco, OpenCost, LiteLLM and others) come to roughly 6–7 GB of its 8 GB. (Hubble UI can be scaled to zero when not in use.) To keep headroom:
 - Let the **ARC runners** tolerate box 2's taint, so evaluation jobs run next to the model (they mostly wait on it anyway).
 - Keep **Prometheus retention** short (e.g. 7 days) and scrape every 30–60 seconds rather than 15.
 - Set requests and memory limits on everything (Kyverno already requires them), so a busy pod can't starve the others.
@@ -944,6 +981,7 @@ The cost column is what russetleaf.dev costs to run 24/7, plus russetleaf.com's 
 | Cost visibility | OpenCost | OpenCost or Kubecost EKS bundle | $0 |
 | Staging (on demand) | Created per promotion on the home cluster, deleted after tests; own bucket, queue, secrets, small Bedrock budget | None (AWS versions are tested at home first) | ~$0–1 |
 | ci test clusters | kind in GitHub Actions with LocalStack and a mock LLM | Same | $0 |
+| Logs | Loki (single binary, S3 storage) + Alloy, 7-day retention | Same, 14-day retention | <$1 |
 | Alerting | Alertmanager → Slack, dead man's switch, uptime checks, Cloudflare notifications | Same, plus CloudWatch alarms via SNS and Amazon Q Developer | $0 |
 | russetleaf.com always-on edge | n/a | Route 53 zone, CloudFront, offline page, media bucket, RDS snapshot (`envs/aws-edge`) | ~$1 |
 | **Total (24/7)** | | | **~$8–$15 / month** |
@@ -982,6 +1020,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Terraform for both sides, in one repo (`wp-infra`):** shared modules, plus separate root modules for russetleaf.com's always-on edge, its demo stack (including Karpenter and its NodePools), and the russetleaf.dev home lab (Talos provider `siderolabs/talos` for both nodes' machine configs, Cloudflare provider for the tunnel, DNS and WAF rules, and the AWS pieces used from home).
 - **CI on GitHub in every repo:** Terraform checks and plans in `wp-infra`; manifest validation and Kyverno policy tests in `wp-gitops`; image builds with SBOMs, scans and signing in `wp-image` and `llm-summarizer`; and the prompt evaluation gate in `llm-summarizer`. Employers see all of it without the AWS stack running.
 - **Environments and promotion:** local, ci (kind + LocalStack + mock LLM per pull request), on-demand scale-to-zero staging with scrubbed production data, and automated promotion to production after staging passes.
+- **Full observability on both sites:** metrics (Prometheus), logs (Loki + Alloy, with log-based alerts), network flows (Hubble), security events (Falco) and optional traces (Tempo), correlated in Grafana.
 - **Application-level monitoring:** exporters around WordPress (Apache, database, cache, synthetic probes) plus a custom metrics plugin with a business-level signal (`posts_without_summary`) tied to an alert and a runbook.
 - **Operational alerting:** alerts as code with tests and runbooks, routed to Slack by site and severity, with inhibition rules, a dead man's switch, external uptime checks and silences during demo teardown.
 - **Documentation:** architecture diagrams for both environments, the cost breakdown, Grafana dashboard screenshots, Slack alert screenshots, runbooks, sample evaluation reports comparing models, and demo recordings.
@@ -1029,7 +1068,7 @@ wp-gitops/
     runbooks/               # one page per alert: what it means, how to check, how to fix
     adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md,
                             #   0002-s3-media-not-efs.md, 0003-kubescape-cli-not-operator.md,
-                            #   0004-ghcr-not-ecr.md)
+                            #   0004-ghcr-not-ecr.md, 0005-loki-alloy-for-logs.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
@@ -1073,6 +1112,8 @@ wp-gitops/
     falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
+    logging/                # Loki (single binary, S3 storage, ruler for log-based alerts) + Grafana Alloy
+                            #   DaemonSet (labels, noise dropping, masking; Talos log receiver at home)
     karpenter/              # Karpenter general and GPU NodePools, EC2NodeClass (aws only)
     kube-bench/             # CIS benchmark Job, EKS profile (aws only)
     llm-gateway/            # LiteLLM + routing config: model list, fallbacks, canary weights, budgets
@@ -1099,6 +1140,7 @@ wp-infra/
                             #   IAM roles for each repo's CI (plan, apply, image push)
   modules/                  # reusable modules shared by both environments
     s3-media/               # media bucket, versioning, IAM policy
+    s3-logs/                # Loki log bucket: encryption, lifecycle matching retention, IAM policy
     s3-backups/             # database backup bucket: versioning, encryption, lifecycle rules, IAM policy
     sqs-queue/              # queue + dead-letter queue + alarms
     secrets/                # Secrets Manager entries

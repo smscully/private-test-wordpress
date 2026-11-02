@@ -73,7 +73,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Route 53 hosted zone for russetleaf.com (point the registrar's name servers at it if needed).
 - ACM certificates: `russetleaf.com` + `www` in us-east-1 (CloudFront), and `origin.russetleaf.com` in the ALB's region (the same region if you chose us-east-1).
-- S3 offline-page bucket with the offline page ("The AWS demo is offline. Visit russetleaf.dev."), the russetleaf.com **media bucket**, and a **model mirror bucket** (the self-hosted model's file, so demo startup doesn't depend on Hugging Face). Origin Access Control on all of them.
+- S3 offline-page bucket with the offline page ("The AWS demo is offline. Visit russetleaf.dev."), the russetleaf.com **media bucket**, a **model mirror bucket** (the self-hosted model's file, so demo startup doesn't depend on Hugging Face), and a **Loki log bucket** (14-day lifecycle; kept in the always-on stack so demo logs can be reviewed after teardown). Origin Access Control on all of them.
 - CloudFront distribution: default behavior → `origin.russetleaf.com` (all methods, HTTPS only, the `X-Origin-Verify` secret header, Host not forwarded); `/wp-content/uploads/*` → media bucket; `/offline/*` → offline bucket; custom error responses 502/503/504 → `/offline/index.html` with status 503; 10-second error caching; origin timeout 2 s, 1 attempt.
 - The secret header value in Secrets Manager.
 - SES domain identity for russetleaf.com, with DKIM records in Route 53.
@@ -165,11 +165,12 @@ Record each answer in the [decision log](#decision-log).
 - Kyverno: the same policy set as home, including SBOM attestations and upstream signature checks (AWS's own add-on images aren't signed with cosign, so they stay covered by the registry allow-list and digest pinning); add AWS's add-on registries (the EKS add-on ECR registries and `public.ecr.aws`) to the **Restrict Image Registries** allow-list, and narrow **`PolicyException`s** for AWS-managed `kube-system` components that need privileged or host access or don't meet the label, probe, non-root or read-only rules (the VPC CNI's `aws-node`, `kube-proxy`, the EBS CSI node agent, the Pod Identity agent), plus Cilium, Falco and the NVIDIA device plugin. The project's own workloads get no exceptions.
 - KEDA: Pod Identity for the SQS scaler.
 - Argo Rollouts: an `AnalysisTemplate` variant using **CloudWatch** (ALB 5xx rate and target response time) instead of ingress-nginx metrics.
+- **Logging:** `platform/logging/overlays/aws`: Loki (S3 via a Pod Identity role on the russetleaf.com log bucket, 14-day retention) and Alloy with `site=com`; no Talos log receiver; the EKS control-plane audit logs stay in CloudWatch. Alloy gets the same narrow Kyverno exception as at home.
 - Falco: modern eBPF on AL2023, same custom rules; Falcosidekick to `#rl-security`.
 - Kyverno's Policy Reporter and Argo Rollouts notifications: same Slack setup as home, prefixed `[com]`.
 - Trivy Operator, OpenCost (with AWS on-demand/spot pricing).
 
-**Test:** each component is healthy; the home lab's Kyverno rejection tests (unsigned image, unlisted registry, `:latest`, missing labels or memory limit, privileged, root, writable root filesystem, no probes, NodePort/LoadBalancer Service, duplicate Ingress host) all still fail on EKS; OpenCost shows EC2 costs for the nodes.
+**Test:** each component is healthy; russetleaf.com's logs are searchable in Grafana and remain in the log bucket after `demo-down`; the home lab's Kyverno rejection tests (unsigned image, unlisted registry, `:latest`, missing labels or memory limit, privileged, root, writable root filesystem, no probes, NodePort/LoadBalancer Service, duplicate Ingress host) all still fail on EKS; OpenCost shows EC2 costs for the nodes.
 
 ### Step 2.5: kube-bench and Kubescape scan
 **Do:**

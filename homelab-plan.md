@@ -160,7 +160,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1); move them with the other docs.
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) and `0005-loki-alloy-for-logs.md` (finish in step 4.6); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Checkov** to every repo's CI from the start, scanning the **GitHub Actions workflows** (unpinned actions, over-broad `permissions`, script injection), with a `.checkov.yaml` per repo. Later steps add each repo's other targets (Terraform, manifests, Dockerfiles, charts). Skips must carry a reason. See [Infrastructure and configuration scanning](aws-wp.md#infrastructure-and-configuration-scanning-checkov).
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
@@ -192,7 +192,7 @@ Record each answer in the [decision log](#decision-log).
 ### Step 2.3: AWS and Cloudflare resources for the home lab
 **Do** (`wp-infra/modules/` + `envs/home/`):
 - Modules: `s3-media`, `s3-backups`, `sqs-queue` (with dead-letter queue), `secrets`, `bedrock-access`.
-- russetleaf.dev resources: media bucket, database-backup bucket (lifecycle: expire after 30 days), **model mirror bucket** (for the self-hosted model's file, used in step 8.1), summary queue + dead-letter queue, Secrets Manager entries (empty placeholders; values set by hand or generated), Bedrock budget alert.
+- russetleaf.dev resources: media bucket, database-backup bucket (lifecycle: expire after 30 days), **model mirror bucket** (for the self-hosted model's file, used in step 8.1), **Loki log bucket** (lifecycle: expire after 7 days, used in step 4.6, plus a scoped IAM key for Loki), summary queue + dead-letter queue, Secrets Manager entries (empty placeholders; values set by hand or generated), Bedrock budget alert.
 - **Staging resources** (a second, smaller set of the same modules, tagged `Env=staging`): staging media bucket, summary queue + dead-letter queue, Secrets Manager entries, and a scoped IAM key that can **read** the production backup bucket but write only to staging resources. Used from step 5.6.
 - **Email:** an SES domain identity for russetleaf.dev, with its DKIM and SPF records created in Cloudflare, and SES SMTP credentials stored in Secrets Manager. (New SES accounts are in the "sandbox" and can only send to verified addresses; verify your own address for testing, or request production access.)
 - Scoped IAM users and keys for the home cluster, one per job: External Secrets (read the russetleaf.dev secrets only), WordPress (media bucket + send to queue), MariaDB backups (backup bucket), summarizer (read from queue), LiteLLM (`bedrock:InvokeModel` on the chosen models only). Store each key in Secrets Manager.
@@ -265,6 +265,17 @@ Check `kubectl top nodes` after each step.
 
 **Test:** connect with a MariaDB client from a test pod using the generated Secret, and confirm a connection **without TLS is refused**; no database password appears in Git or Secrets Manager; trigger a backup by hand and see the file in S3; **restore it into a scratch MariaDB instance** and compare; `valkey-cli ping` returns `PONG`; MariaDB and Valkey metrics appear in Prometheus and on Grafana dashboards.
 
+### Step 4.6: Logging (Loki + Alloy)
+**Do:** `platform/logging/`, as described in `aws-wp.md` ([Logging](aws-wp.md#logging-loki--alloy)):
+- **Loki** in single-binary mode, storing data in the Loki S3 bucket (scoped key from External Secrets), a small local cache volume, **7-day retention**, the **ruler** sending alerts to Alertmanager.
+- **Grafana Alloy** DaemonSet: collect all container logs; labels `site=dev`, `env`, `cluster`, `namespace`, `app`, `container` only; drop debug lines and health-check access logs; mask tokens and passwords in query strings; a host port receiving **Talos system logs**.
+- In `wp-infra/envs/home`, point Talos's machine logging at Alloy's host port on each node.
+- A narrow Kyverno **`PolicyException`** for Alloy (host paths for log files, the host port).
+- Loki as a Grafana data source, with links from dashboards to logs; starter log-based alerts (`LokiIngestionErrors` now; the WordPress, summarizer and Bedrock ones are added in steps 5.2 and 7.5) with runbooks.
+- Record memory use in the checklist, and daily log volume and memory after a week in `docs/adr/0005-loki-alloy-for-logs.md`.
+
+**Test:** in Grafana, logs from every namespace and from the Talos nodes (kubelet, etcd) are searchable by `namespace` and `app`; a deleted pod's logs are still there; a secret in a test log line is masked; stopping Loki fires `LokiIngestionErrors` in `#rl-dev-alerts`; objects older than the retention period are removed from the bucket.
+
 ## Phase 5: WordPress
 
 ### Step 5.1: The WordPress image (`wp-image`)
@@ -295,7 +306,7 @@ Check `kubectl top nodes` after each step.
 - Remove the old test Application and the `wordpress-test` namespace.
 - First-run setup (admin user, plugin settings) done by a one-off `wp-cli` Job or wp-config constants, so a rebuild needs no clicking.
 
-- **Monitoring in the chart:** an **apache_exporter** sidecar; a `ServiceMonitor` for the exporter and the metrics port; `PrometheusRule` alerts with runbooks (`WordPressCronBacklog`, `WordPressObjectCacheHitRatioLow`, `WordPressApacheWorkersSaturated`, `WordPressSyntheticProbeFailing`; `WordPressPostsMissingSummaries` is added in step 7.4); a CiliumNetworkPolicy rule letting only Prometheus reach the metrics port. Add the WordPress URLs to the blackbox_exporter probes.
+- **Monitoring in the chart:** an **apache_exporter** sidecar; a `ServiceMonitor` for the exporter and the metrics port; `PrometheusRule` alerts with runbooks (`WordPressCronBacklog`, `WordPressObjectCacheHitRatioLow`, `WordPressApacheWorkersSaturated`, `WordPressSyntheticProbeFailing`; `WordPressPostsMissingSummaries` is added in step 7.4), plus the log-based `WordPressPHPFatalErrors` alert in Loki; a CiliumNetworkPolicy rule letting only Prometheus reach the metrics port. Add the WordPress URLs to the blackbox_exporter probes.
 
 **Test:** `https://russetleaf.dev` serves WordPress; an uploaded image lands in the S3 bucket and displays; the Redis Object Cache plugin shows "connected"; killing the WordPress pod loses nothing; WP-Cron jobs run from the CronJob; a password-reset email arrives through SES; Prometheus scrapes the apache_exporter and the custom metrics; the metrics port is **not** reachable through `https://russetleaf.dev` or from a non-Prometheus pod; the blackbox probes are green.
 
@@ -421,7 +432,7 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 **Test (end to end):** the kind tests pass in CI; a release goes through staging and is promoted; then publish a post on russetleaf.dev → a summarizer pod starts → the summary appears on the post within a few minutes → the pod scales back to zero. A message that always fails ends up in the dead-letter queue.
 
 ### Step 7.5: LLM monitoring
-**Do:** OpenTelemetry metrics in the summarizer (tokens, latency, errors, fallbacks, estimated cost, all labelled by model and prompt version); the Grafana LLM dashboard and `PrometheusRule` alerts shipped **in the summarizer chart** (error spike, dead-letter queue not empty, daily Bedrock spend over a limit, all labelled `team=mlops` so they go to `#rl-mlops`, with runbooks); SQS queue depth in Grafana.
+**Do:** OpenTelemetry metrics in the summarizer (tokens, latency, errors, fallbacks, estimated cost, all labelled by model and prompt version); the Grafana LLM dashboard and `PrometheusRule` alerts shipped **in the summarizer chart** (error spike, dead-letter queue not empty, daily Bedrock spend over a limit, all labelled `team=mlops` so they go to `#rl-mlops`, with runbooks), plus the log-based `SummarizerExceptions` and `BedrockThrottling` alerts in Loki; SQS queue depth in Grafana.
 
 **Test:** the dashboard shows real numbers after a few posts; temporarily lowering the spend limit makes the alert appear in `#rl-mlops`.
 
@@ -510,6 +521,7 @@ These keep russetleaf.dev healthy once it's running. Add each as a calendar remi
 | Rotate MariaDB passwords | Quarterly | Regenerate the operator-managed Secret (or use the operator's rotation feature), then restart WordPress through its Rollout; check the backup user still works |
 | Rotate scoped IAM keys | Every 90 days, until step 11.1 removes them | Create a new key in Terraform, update Secrets Manager, let External Secrets sync it, delete the old key |
 | Review alerts, costs and Bedrock spend | Monthly | Grafana, OpenCost, the AWS Budget and Cost Explorer (filter by `Site=dev`) |
+| Review log volume | Monthly | Check Loki's daily ingestion and box 1's memory; drop or shorten noisy sources at Alloy |
 | Review alert noise | Monthly | Look at what fired in the Slack channels: remove or tune alerts nobody acted on, and update runbooks that didn't help |
 | Test the outside monitoring | Quarterly | Pause the heartbeat or block the uptime check and confirm `#rl-critical` is notified |
 
@@ -542,6 +554,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 4.3 Ingress + tunnel | ☐ | | | |
 | 4.4 Monitoring + Slack alerting | ☐ | | | |
 | 4.5 MariaDB + backups + Valkey | ☐ | | | |
+| 4.6 Logging (Loki + Alloy) | ☐ | | | |
 | 5.1 WordPress image | ☐ | | | |
 | 5.2 WordPress deployment | ☐ | | | |
 | 5.3 Image promotion | ☐ | | | |
