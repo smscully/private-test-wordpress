@@ -140,12 +140,14 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 - `DISALLOW_FILE_MODS` set to `true` (no plugin or theme installs from the admin screen).
 
 ### Supply chain and policy
-- CI builds each image, generates an **SBOM** (a list of every package in the image) with **Syft**, scans it with **Trivy**, and **signs** it with **cosign** (keyless, using GitHub's OIDC identity).
+- CI builds each image, generates an **SBOM** (a list of every package in the image) with **Syft**, scans it with **Trivy**, **signs** it with **cosign** (keyless, using GitHub's OIDC identity), and attaches the SBOM to the image as a **signed attestation** (`cosign attest`, e.g. in SPDX JSON format). The attestation is stored in GHCR next to the image and recorded in Sigstore's transparency log, so anyone can check which packages a given image contains, and that the list came from the project's own CI.
 - **Kyverno** policies in the cluster (each named after its equivalent in the official Kyverno policy library):
 
 | Policy | Kyverno equivalent | What it enforces here |
 |---|---|---|
 | Signed images | Image verification (`verifyImages`, cosign keyless) | Only images signed by the `wp-image` and `llm-summarizer` release workflows run as the project's own workloads; tags are replaced with **digests** at admission (`mutateDigest`), so a re-pushed tag can't change what runs |
+| SBOM attestations | Image verification with an `attestations` check | The project's own images must also carry a **signed SBOM attestation** from the same release workflow; an image without one is rejected |
+| Signed upstream images | Image verification (`verifyImages`) per upstream publisher | Third-party images from publishers that sign with cosign (e.g. **Kyverno** and **Cilium**; check each upstream's current practice before relying on it) must carry a valid signature from **that publisher's** release identity, so a tampered or substituted upstream image is rejected, not just one from an unknown registry. Images from publishers that don't sign stay covered by the registry allow-list and digest pinning. The list of verified publishers and their identities is kept in the policy, and new entries start in audit mode. Kyverno's own namespace is excluded from these checks, so Kyverno can always start (otherwise it could block itself) |
 | Allowed registries | **Restrict Image Registries** (`restrict-image-registries`) | Every container (including init and ephemeral containers) comes from `ghcr.io/<you>/*` or an explicit list of upstream registries used by the platform charts (Cilium, Falco, Argo CD, MariaDB, ...); on EKS, also AWS's own add-on registries |
 | No `latest` tag | **Disallow Latest Tag** (`disallow-latest-tag`) | Every image has an explicit tag or digest |
 | Required labels | **Require Labels** (`require-labels`), plus a **mutate** rule | Workloads carry `app.kubernetes.io/name`, `app.kubernetes.io/part-of` and `env`; the mutate rule fills in `env` from the namespace, so the validate rule is only a backstop. These labels drive alert routing, OpenCost and policy selectors |
@@ -971,7 +973,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
 - **Architecture decision records:** documented choices with their trade-offs, e.g. why media is on S3 rather than the commonly recommended EFS, and why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
 - **Zero-trust networking with Cilium on both clusters:** WireGuard encryption between nodes, default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
-- **Supply-chain security and policy as code:** SBOMs, vulnerability scans and signed images in CI, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov scanning Terraform, rendered manifests, Helm charts, Dockerfiles and GitHub Actions workflows in all four repos, with results in GitHub code scanning.
+- **Supply-chain security and policy as code:** SBOMs attached as signed attestations, vulnerability scans and signed images in CI, signature checks on upstream images too, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov scanning Terraform, rendered manifests, Helm charts, Dockerfiles and GitHub Actions workflows in all four repos, with results in GitHub code scanning.
 - **Runtime security and compliance:** Falco rules written for this application (shells in pods, writes to WordPress code, unexpected egress from LLM nodes), alerts in Grafana, CIS benchmark reports from kube-bench on EKS, continuous Trivy Operator compliance reports on both clusters, and periodic Kubescape NSA-CISA, MITRE ATT&CK and RBAC reports.
 - **Cost awareness (FinOps):** OpenCost shows cost per namespace and workload, including the GPU node and cost per summary, next to the Bedrock spend.
 - **EKS node autoscaling with Karpenter:** general and GPU NodePools, spot with interruption handling, and consolidation, with a documented reason it doesn't apply to fixed home hardware.
@@ -1149,7 +1151,7 @@ wp-image/
   tests/                    # smoke test: the container starts, plugins are active, health check passes
   ci/                       # kind config, ci chart values (LocalStack, test credentials), integration tests
   compose.yaml              # local environment: WordPress + MariaDB + Valkey + LocalStack
-  .github/workflows/        # build, SBOM (Syft), scan (Trivy), sign (cosign), kind integration tests, push image
+  .github/workflows/        # build, SBOM (Syft), scan (Trivy), sign + SBOM attestation (cosign), kind integration tests, push image
                             #   + chart to GHCR, open a version-bump pull request on wp-gitops (staging overlay)
 ```
 
@@ -1172,7 +1174,7 @@ llm-summarizer/
   ci/                       # kind config, ci chart values (LocalStack SQS, mock LLM), end-to-end tests
   MODEL_CARD.md             # models evaluated, scores, cost per summary, known limitations
   .github/workflows/        # unit tests; kind end-to-end tests (mock LLM); evaluation gate (on ARC runners);
-                            #   on release: gate again, build image and chart, SBOM, scan, sign, publish,
+                            #   on release: gate again, build image and chart, SBOM, scan, sign + attest SBOM, publish,
                             #   open a chart-bump pull request on wp-gitops (staging overlay)
 ```
 
@@ -1217,7 +1219,7 @@ The self-hosted model isn't a special case: its deployment is ordinary platform 
 | `llm-summarizer` CI | Push images and charts; cosign keyless signing; pull requests on `wp-gitops` via the bot; evaluation runs on in-cluster ARC runners, which call Bedrock through the gateway |
 | Argo CD (both clusters) | Read `wp-gitops` and pull charts and images (public repos and public GHCR packages need no credentials; GHCR packages are private by default, even in public repos, so make them public separately or provide credentials) |
 | `staging-test` workflow (ARC runners) | An Argo CD account limited to the staging project (sync and delete staging Applications only); posts to `#rl-staging` |
-| Kyverno | Admits only images signed by the `wp-image` and `llm-summarizer` release workflows (cosign keyless: GitHub OIDC issuer `https://token.actions.githubusercontent.com`, subject matching each repo's release workflow on `main` or a tag) |
+| Kyverno | Admits only images signed by the `wp-image` and `llm-summarizer` release workflows (cosign keyless: GitHub OIDC issuer `https://token.actions.githubusercontent.com`, subject matching each repo's release workflow on `main` or a tag) and carrying their signed SBOM attestation; verifies upstream publishers' signatures where they sign |
 
 ### Making a change that spans repos
 Work **infrastructure first, then code, then config**, so nothing is deployed before what it depends on exists. Example: the summarizer needs a new SQS queue.
