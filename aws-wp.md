@@ -193,6 +193,13 @@ How it's run:
   - **files written under `/var/www/html`**, since WordPress code is built into the image and `DISALLOW_FILE_MODS` is set
   - **unexpected outbound connections** from the LLM nodes, which should only download model files (the CiliumNetworkPolicies also block these; Falco detects any attempt)
 - **Falcosidekick** sends Falco alerts to Alertmanager, Grafana and Slack (`#rl-security`). (On AWS, GuardDuty EKS Runtime Monitoring is the managed alternative; Falco runs the same on both clusters.)
+- **Falco runs continuously, not on a schedule:** it's a DaemonSet (one pod per node) watching system calls live, so alerts arrive within seconds. Because nothing re-runs it if it stops, **Falco's own health is monitored**: Falco's and Falcosidekick's metrics are scraped by Prometheus (ServiceMonitors), with these alerts (runbooks in `docs/runbooks/`):
+
+| Alert | Fires when | Goes to |
+|---|---|---|
+| `FalcoNotRunning` | The Falco DaemonSet has fewer ready pods than nodes for 10 minutes (from kube-state-metrics), i.e. a node is unprotected | `#rl-security` + `#rl-critical` |
+| `FalcosidekickOutputErrors` | Falcosidekick fails to deliver alerts to Alertmanager or Slack | `#rl-security` |
+| `FalcoEventsDropped` | Falco reports dropped system-call events (it can't keep up, so detections may be missed) | `#rl-security` |
 - **kube-bench** audits the cluster against the **CIS Kubernetes Benchmark**, run as a Job with the EKS profile. Reports are saved to `docs/` in `wp-gitops`.
 - **Trivy Operator** runs continuously in the cluster, producing CIS compliance reports, vulnerability reports for running images, and configuration audits.
 - **Kubescape CLI**, run on demand (monthly at home, once per AWS demo on EKS) from the workstation or the in-cluster CI runners, with **nothing installed in the cluster**: scores each cluster against the **NSA-CISA** and **MITRE ATT&CK** frameworks and analyses **RBAC** for risky permissions, the one area no other tool here covers. Reports are saved in `docs/` in `wp-gitops`. It complements kube-bench rather than replacing it: kube-bench checks node and control-plane configuration directly on the nodes; Kubescape checks workloads and permissions through the Kubernetes API. The in-cluster Kubescape operator is deliberately not used (0.5–1 GB of memory, mostly duplicating Trivy Operator and Falco); see `docs/adr/0003-kubescape-cli-not-operator.md`.
@@ -1150,7 +1157,8 @@ wp-gitops/
                             #   read-only root filesystem, probes, no NodePort/LoadBalancer Services, unique
                             #   Ingress hosts) + PolicyExceptions + the default-deny Cilium generate rule
                             #   + policy tests + Policy Reporter (violations to Slack)
-    falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick
+    falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick + ServiceMonitors and health
+                            #   alerts (FalcoNotRunning, FalcosidekickOutputErrors, FalcoEventsDropped)
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
     logging/                # Loki (single binary, S3 storage, ruler for log-based alerts) + Grafana Alloy

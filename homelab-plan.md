@@ -475,8 +475,9 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 
 ### Step 10.1: Falco
 **Do:** `platform/falco/`: Falco with the **modern eBPF** driver (Talos doesn't allow kernel modules), Falcosidekick to Alertmanager, Grafana and Slack (`#rl-security`, warning priority and above), and custom rules: shell in WordPress, summarizer or gateway pods; writes under `/var/www/html`; unexpected outbound connections from box 2.
+- **Falco's own health:** Falco and Falcosidekick metrics with ServiceMonitors, and the alerts `FalcoNotRunning` (fewer ready Falco pods than nodes for 10 minutes; to `#rl-security` and `#rl-critical`), `FalcosidekickOutputErrors` and `FalcoEventsDropped` (to `#rl-security`), each with a runbook.
 
-**Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana and `#rl-security`; creating a file under `/var/www/html` triggers another.
+**Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana and `#rl-security`; creating a file under `/var/www/html` triggers another; deleting the Falco pod on one node (or temporarily preventing it from scheduling there) fires `FalcoNotRunning` in `#rl-security` and `#rl-critical`; pointing Falcosidekick at a wrong Slack destination fires `FalcosidekickOutputErrors`.
 
 ### Step 10.2: Trivy Operator, Kubescape scan and Talos hardening notes
 **Do:** `platform/trivy-operator/` with modest scan concurrency (it's memory hungry on 8 GB); write `docs/talos-hardening.md` explaining how Talos meets the CIS benchmark (no shell or SSH, read-only system, API-only management, default pod security). Run the first **Kubescape CLI** scan of the home cluster from the workstation (NSA-CISA and MITRE ATT&CK frameworks, plus RBAC analysis; nothing installed in the cluster), save the report and a short summary of accepted findings in `docs/security/`, and fill in the baseline in `docs/adr/0003-kubescape-cli-not-operator.md`.

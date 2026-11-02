@@ -167,7 +167,7 @@ Record each answer in the [decision log](#decision-log).
 - Argo Rollouts: an `AnalysisTemplate` variant using **CloudWatch** (ALB 5xx rate and target response time) instead of ingress-nginx metrics.
 - **Logging:** `platform/logging/overlays/aws`: Loki (S3 via a Pod Identity role on the russetleaf.com log bucket, 14-day retention) and Alloy with `site=com`; no Talos log receiver; the EKS control-plane audit logs stay in CloudWatch. Alloy gets the same narrow Kyverno exception as at home.
 - **Tracing:** `platform/tracing/overlays/aws`: Tempo (S3 via a Pod Identity role on the trace bucket, 7-day retention), **always on**; Alloy's OTLP receiver forwards to it; tracing turned on in the WordPress, summarizer and gateway values with **100% sampling**.
-- Falco: modern eBPF on AL2023, same custom rules; Falcosidekick to `#rl-security`.
+- Falco: modern eBPF on AL2023, same custom rules; Falcosidekick to `#rl-security`; the same health alerts as home (`FalcoNotRunning`, `FalcosidekickOutputErrors`, `FalcoEventsDropped`). On EKS, `FalcoNotRunning` also catches a new Karpenter node where Falco hasn't started.
 - Kyverno's Policy Reporter and Argo Rollouts notifications: same Slack setup as home, prefixed `[com]`.
 - Trivy Operator, OpenCost (with AWS on-demand/spot pricing).
 
