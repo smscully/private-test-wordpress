@@ -31,6 +31,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Network policies | **CiliumNetworkPolicies** (default-deny, DNS-name egress rules), enforced by Cilium | **CiliumNetworkPolicies**, same base policies |
 | Encryption in transit | TLS on sensitive connections; Cilium WireGuard between nodes, if supported in chaining mode | TLS on sensitive connections; Cilium WireGuard between nodes |
 | Service mesh | None, by decision (ADR) | None, by decision (ADR) |
+| Container isolation | seccomp `RuntimeDefault` for every workload; no gVisor | seccomp `RuntimeDefault`; **gVisor** for the CI runners (and WordPress, if its load test passes) |
 | Admin sign-in | Google (OIDC) in WordPress, behind the ALB's OIDC rule on admin paths | Google (OIDC) in WordPress, behind Cloudflare Access on admin paths |
 | Logs | Loki + Alloy, 14-day retention (bucket in the always-on edge stack); control-plane audit logs in CloudWatch | Loki + Alloy, 7-day retention, including Talos system logs |
 | Traces | Tempo, on for every demo, 7-day retention (bucket in the always-on edge stack) | Tempo on demand, 3-day retention |
@@ -158,6 +159,8 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 | Requests and limits | **Require Requests and Limits** (`require-requests-limits`) | CPU and memory **requests** and a **memory limit** on every container. **CPU limits are deliberately not required**: they cause throttling (slowing WordPress and llama.cpp) without protecting anything; memory limits are what protect box 1 |
 | No privileged containers | **Disallow Privileged Containers** (`disallow-privileged-containers`), within Kyverno's **Pod Security Standards** `baseline` rule set | No privileged containers, host paths or host namespaces (network, PID, IPC). Talos already enforces Pod Security `baseline`; Kyverno adds reporting, CI tests and narrow exceptions |
 | Run as non-root | **Require Run As Non-Root** (`require-run-as-nonroot`), from the Pod Security `restricted` set | Containers run as a non-root user. The WordPress image runs Apache as `www-data` on port 8080 (non-root processes can't use port 80) |
+| seccomp profile | **Restrict Seccomp (Strict)** (`restrict-seccomp-strict`), from the Pod Security `restricted` set | Every container runs with `seccompProfile: RuntimeDefault`, which blocks dozens of rarely needed, risky system calls at no cost; see [Sandboxed runtimes](#sandboxed-runtimes-gvisor) |
+| Sandboxed CI runners (home) | A validate rule on `runtimeClassName` | Pods in the ARC runners' namespace must use the `gvisor` RuntimeClass |
 | Read-only root filesystem | **Require Read-Only Root Filesystem** (`require-ro-rootfs`) | Containers can't write to their own filesystem. WordPress gets small writable `emptyDir` volumes for `/tmp`, Apache's run and lock directories, PHP sessions and, only if the chosen offload plugin writes uploads locally first, the uploads directory. Backs up the Falco rule on writes to `/var/www/html` |
 | Health probes | **Require Pod Probes** (`require-pod-probes`) | Readiness and liveness probes on every long-running workload; Argo Rollouts, the HPA and Kubernetes' own restarts depend on them |
 | No NodePorts | **Disallow NodePort** (`restrict-nodeport`), plus a rule blocking `LoadBalancer` Services | Nothing needs them: traffic arrives through the Cloudflare Tunnel at home and through the ALB (created from an Ingress, target type `ip`) on AWS |
@@ -170,6 +173,31 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
 
 - The **Kyverno CLI** (`kyverno test` and `kyverno apply`) runs the same policies in `wp-gitops` CI against every manifest change, so violations fail the pull request before Argo CD ever deploys them. This covers the "policy checks before deploy" role often given to OPA, without a second policy engine.
 - **Checkov** scans infrastructure and configuration code in **all four repos'** CI (see below), so insecure settings fail the pull request before anything is applied, built or deployed.
+
+### Sandboxed runtimes (gVisor)
+Normally every container shares the node's Linux kernel, so a kernel exploit from inside one container could compromise the whole node. Two layers reduce that risk:
+
+1. **seccomp `RuntimeDefault` for every workload** (both sites): the container runtime's default seccomp profile blocks dozens of rarely needed, risky system calls. It costs nothing in performance or memory and is required by Kyverno (see the policy table above).
+2. **gVisor for the highest-risk workloads** (home only): gVisor runs a pod on a kernel written in user space (`runsc`), which intercepts the container's system calls, so the pod never talks to the host kernel directly. Pods opt in with a **RuntimeClass** (`runtimeClassName: gvisor`).
+
+| Workload | gVisor? | Why |
+|---|---|---|
+| **ARC self-hosted CI runners** | **Yes (enforced)** | They run code from pull requests, the classic risk for self-hosted runners. The evaluation and staging jobs are plain Python and CLI tools, which gVisor handles well. A Kyverno rule requires `runtimeClassName: gvisor` in the runners' namespace |
+| **WordPress** | **Trial**, kept only if performance is acceptable | Internet-facing PHP; plugin vulnerabilities are WordPress's most common attack route. gVisor slows workloads that make many system calls and do lots of file I/O, so a before-and-after load test decides |
+| llama.cpp | Optional | Parses downloaded model files; CPU-only at home (gVisor's GPU support is limited) |
+| Summarizer, gateway, platform components | No | Project code or trusted infrastructure (Cilium, Falco and other node agents need host access) |
+
+**How it's installed (home):** Talos's official **gVisor system extension**, added to the Talos image for each node (through Talos's Image Factory, managed in `wp-infra/envs/home`), plus a `RuntimeClass` named `gvisor` in `wp-gitops`.
+
+**Effects on other tools:**
+- **Falco** must have its **gVisor event source** turned on, or it sees much less inside gVisor pods.
+- **Cilium** network policies and Hubble keep working: gVisor pods still use the normal pod network interface.
+
+**russetleaf.com (EKS):** gVisor isn't used. AWS doesn't offer it as a managed option, and installing it through a custom AMI or node user data isn't worth it for a demo cluster (the CI runners only run at home anyway). seccomp `RuntimeDefault` still applies.
+
+**Kata Containers** (a lightweight VM per pod) was considered and not used: each pod's VM needs its own memory, which 8 GB nodes can't spare, and on AWS it needs hardware virtualization inside the instance (historically bare-metal instances only).
+
+The reasoning is recorded in `docs/adr/0009-gvisor-sandboxing.md`.
 
 ### Infrastructure and configuration scanning (Checkov)
 **Checkov** (free, open source, no account needed) is the project's scanner for infrastructure-as-code and configuration. Snyk isn't used: it's a commercial platform whose free tier limits monthly scans, and it would overlap with Checkov (configuration) and Trivy (images and dependencies) without adding coverage.
@@ -1093,6 +1121,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **LLM monitoring:** token, latency, error, fallback and cost metrics per model and prompt version, plus model-server throughput, in Prometheus and Grafana, with alerts.
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
 - **Architecture decision records:** documented choices with their trade-offs, e.g. why media is on S3 rather than the commonly recommended EFS, and why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
+- **Defence in depth for containers:** seccomp `RuntimeDefault` everywhere, and gVisor sandboxing for the self-hosted CI runners that run pull-request code (with a measured trial for WordPress), backed by an ADR comparing gVisor and Kata Containers.
 - **Passwordless admin access:** Google sign-in (OIDC) for WordPress, an edge login layer (Cloudflare Access at home, ALB OIDC on AWS), application passwords kept only for the REST API, and break-glass recovery with `wp-cli`.
 - **Zero-trust networking with Cilium on both clusters:** WireGuard encryption between nodes, default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
 - **Supply-chain security and policy as code:** SBOMs attached as signed attestations, vulnerability scans and signed images in CI, signature checks on upstream images too, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov scanning Terraform, rendered manifests, Helm charts, Dockerfiles and GitHub Actions workflows in all four repos, with results in GitHub code scanning.
@@ -1154,7 +1183,7 @@ wp-gitops/
                             #   0002-s3-media-not-efs.md, 0003-kubescape-cli-not-operator.md,
                             #   0004-ghcr-not-ecr.md, 0005-loki-alloy-for-logs.md,
                             #   0006-tempo-tracing.md, 0007-prowler-not-threatmapper.md,
-                            #   0008-google-sign-in-for-admins.md)
+                            #   0008-google-sign-in-for-admins.md, 0009-gvisor-sandboxing.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
@@ -1196,6 +1225,7 @@ wp-gitops/
                             #   Ingress hosts) + PolicyExceptions + the default-deny Cilium generate rule
                             #   + policy tests + Policy Reporter (violations to Slack)
     falco/                  # Falco (modern eBPF) + custom rules + Falcosidekick + ServiceMonitors and health
+                            #   gVisor event source (home) for sandboxed pods
                             #   alerts (FalcoNotRunning, FalcosidekickOutputErrors, FalcoEventsDropped)
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
@@ -1209,7 +1239,8 @@ wp-gitops/
     llm-serving/            # llama.cpp model server, tolerations/node selector;
                             #   home: CPU build on box 2, aws: CUDA build on the GPU NodePool
     actions-runner-controller/  # ARC + ephemeral self-hosted GitHub Actions runners (for llm-summarizer's
-                            #   evaluation gate and wp-gitops' staging-test workflow)
+                            #   evaluation gate and wp-gitops' staging-test workflow), running under gVisor
+    runtime-classes/        # gvisor RuntimeClass (home only; the Talos gVisor extension is in wp-infra)
   .github/workflows/        # render every overlay (Helm/Kustomize), validate against Kubernetes schemas
                             #   (kubeconform), run Kyverno CLI policy tests, promtool tests; install changed
                             #   platform components into kind; staging-test (on ARC runners); promote-to-prod
@@ -1275,7 +1306,8 @@ wp-image/
                             #   OIDC login, ...)
   chart/                    # the WordPress Helm chart: Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob,
                             #   CiliumNetworkPolicy (per-site destinations set in values), probes, non-root +
-                            #   read-only root filesystem with emptyDir volumes for writable paths
+                            #   read-only root filesystem with emptyDir volumes for writable paths, seccomp
+                            #   RuntimeDefault, optional runtimeClassName (gvisor at home, if the trial passes)
                             #   + apache_exporter sidecar, ServiceMonitor and PrometheusRule alerts
   mu-plugins/
     summary-queue/          # sends post IDs to SQS when a post is published or updated

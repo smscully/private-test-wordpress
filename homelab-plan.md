@@ -80,6 +80,7 @@ Tools to pin (check each name with `mise registry | grep <tool>`; pin `kubectl` 
 | `argocd` | Argo CD CLI (staging workflow, debugging) |
 | `k9s`, `stern`, `kubectx` | Day-to-day cluster work (optional but very useful) |
 | `kubeconform`, `chart-testing` (`ct`) | Manifest and chart validation |
+| `k6` | Load tests (e.g. WordPress with and without gVisor, step 6.5) |
 | `cilium`, `hubble` | Cilium status and connectivity tests; Hubble flow queries |
 | `kyverno` | Policy tests |
 | `cosign`, `syft`, `trivy` | Image signing, SBOMs, scanning |
@@ -161,7 +162,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) `0005-loki-alloy-for-logs.md` (finish in step 4.6) and `0006-tempo-tracing.md` (finish in step 10.4) and `0007-prowler-not-threatmapper.md` (finish in step 10.5) and `0008-google-sign-in-for-admins.md` (finish in step 5.8); move them with the other docs.
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) `0005-loki-alloy-for-logs.md` (finish in step 4.6) and `0006-tempo-tracing.md` (finish in step 10.4) and `0007-prowler-not-threatmapper.md` (finish in step 10.5) and `0008-google-sign-in-for-admins.md` (finish in step 5.8) and `0009-gvisor-sandboxing.md` (finish in step 6.5); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Checkov** to every repo's CI from the start, scanning the **GitHub Actions workflows** (unpinned actions, over-broad `permissions`, script injection), with a `.checkov.yaml` per repo. Later steps add each repo's other targets (Terraform, manifests, Dockerfiles, charts). Skips must carry a reason. See [Infrastructure and configuration scanning](aws-wp.md#infrastructure-and-configuration-scanning-checkov).
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
@@ -183,6 +184,7 @@ Record each answer in the [decision log](#decision-log).
 **Do** (`wp-infra/envs/home/`, applied locally; uses the `siderolabs/talos` provider):
 - Generate machine secrets; machine configs for **box 1 (control plane, schedulable)** and **box 2 (worker)**.
 - Box 2: node label `workload=llm`, taint `dedicated=llm:NoSchedule`.
+- Both nodes: the Talos image includes the **gVisor system extension** (built through Talos's Image Factory and referenced in the machine config), used in step 6.5.
 - Both nodes: kubelet extra mount for `/var/local-path-provisioner` (needed in step 4.1).
 - **Cilium:** in the machine config, set `cluster.network.cni.name: none` and `cluster.proxy.disabled: true` (Cilium replaces kube-proxy). Install Cilium with Terraform's Helm provider right after bootstrap (nothing else can run without a CNI), using Talos's documented Cilium values: `kubeProxyReplacement: true`, `k8sServiceHost: localhost`, `k8sServicePort: 7445` (KubePrism), and the cgroup and capability settings Talos requires. Turn on Hubble and Hubble Relay, and **WireGuard transparent encryption** (`encryption.enabled: true`, `encryption.type: wireguard`). Keep Cilium's ServiceMonitors **off** here (the Prometheus Operator doesn't exist yet; step 4.4 turns them on). Use `lifecycle { ignore_changes }` so Terraform installs Cilium once and Argo CD manages it afterwards (step 3.1).
 - Apply configs, bootstrap etcd, output kubeconfig and talosconfig (save them outside Git).
@@ -304,7 +306,7 @@ Check `kubectl top nodes` after each step.
 
 ### Step 5.2: WordPress chart and deployment (`wp-gitops/apps/wordpress/`)
 **Do:**
-- The `wp-image` chart, which sets the pod security context (non-root user, read-only root filesystem, no privilege escalation, dropped capabilities), the `emptyDir` volumes above, **readiness and liveness probes**, the required labels (`app.kubernetes.io/name`, `app.kubernetes.io/part-of`, `env`) and **CPU/memory requests with a memory limit (no CPU limit)**, deployed from `wp-gitops` with the home overlay (values only): russetleaf.dev hostname, MariaDB and Valkey hosts, `database.auth: password` pointing at the **MariaDB Operator-generated Secret**, media bucket and queue settings, other credentials from External Secrets, resources, `persistence` off, WP-Cron as a Kubernetes CronJob.
+- The `wp-image` chart, which sets the pod security context (non-root user, read-only root filesystem, no privilege escalation, dropped capabilities, **seccomp `RuntimeDefault`**, and an optional `runtimeClassName` used in step 6.5), the `emptyDir` volumes above, **readiness and liveness probes**, the required labels (`app.kubernetes.io/name`, `app.kubernetes.io/part-of`, `env`) and **CPU/memory requests with a memory limit (no CPU limit)**, deployed from `wp-gitops` with the home overlay (values only): russetleaf.dev hostname, MariaDB and Valkey hosts, `database.auth: password` pointing at the **MariaDB Operator-generated Secret**, media bucket and queue settings, other credentials from External Secrets, resources, `persistence` off, WP-Cron as a Kubernetes CronJob.
 - Remove the old test Application and the `wordpress-test` namespace.
 - First-run setup (admin user, plugin settings) done by a one-off `wp-cli` Job or wp-config constants, so a rebuild needs no clicking.
 
@@ -376,6 +378,7 @@ Check `kubectl top nodes` after each step.
 - **Require Labels** (`app.kubernetes.io/name`, `app.kubernetes.io/part-of`, `env`), plus a **mutate** rule that adds `env` from the namespace
 - **Require Requests and Limits:** CPU and memory requests and a memory limit; **no CPU limit required**
 - **Pod Security Standards `baseline`** (includes Disallow Privileged Containers, host paths and host namespaces)
+- **Restrict Seccomp (Strict):** every container must use `seccompProfile: RuntimeDefault` (exceptions only for third-party components that genuinely need another profile)
 - **Require Run As Non-Root**
 - **Require Read-Only Root Filesystem**
 - **Require Pod Probes** (readiness and liveness on long-running workloads)
@@ -411,6 +414,15 @@ Review the policy reports, fix violations, then switch to **enforce**.
 - **Optional experiment (local only):** in a kind cluster on your workstation running Cilium, install **Istio ambient mode** (following Istio's instructions for running alongside Cilium), deploy the WordPress chart with test values, and enable mTLS and one layer-7 authorization policy. Record memory use, setup issues and what it added in the ADR. Delete the cluster afterwards; nothing in either site depends on it.
 
 **Test:** the ADR is reviewed and linked from the hub README and the decision log; if the experiment was run, its findings are in the ADR.
+
+### Step 6.5: Sandboxed runtime (gVisor)
+**Do:** as described in `aws-wp.md` ([Sandboxed runtimes](aws-wp.md#sandboxed-runtimes-gvisor)):
+- Confirm the gVisor extension is active on both nodes (step 2.2), and add `platform/runtime-classes/` with a **`gvisor` RuntimeClass**.
+- **ARC runners:** set `runtimeClassName: gvisor` on the runner pods, and add a Kyverno rule requiring it in the runners' namespace. Run every workflow that uses the runners (evaluation gate, staging test) and fix anything that doesn't work under gVisor.
+- **WordPress trial:** load-test russetleaf.dev's WordPress in **staging** with `k6` (home page, a post, the REST API) with and without `runtimeClassName: gvisor`. Keep gVisor for WordPress only if response times and error rates stay within an agreed margin (e.g. 95th-percentile latency no more than 20% worse); record the numbers and decision in `docs/adr/0009-gvisor-sandboxing.md`.
+- Note for step 10.1: Falco needs its **gVisor event source** turned on for sandboxed pods.
+
+**Test:** a runner pod shows `runtimeClassName: gvisor` and the evaluation and staging workflows pass on it; a runner pod without the RuntimeClass is rejected by Kyverno; `dmesg` inside a gVisor pod shows gVisor's own kernel messages rather than the host's; the WordPress load-test results and decision are recorded in the ADR.
 
 ## Phase 7: AI post summaries
 
@@ -488,10 +500,10 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 ## Phase 10: Runtime security, compliance and cost
 
 ### Step 10.1: Falco
-**Do:** `platform/falco/`: Falco with the **modern eBPF** driver (Talos doesn't allow kernel modules), Falcosidekick to Alertmanager, Grafana and Slack (`#rl-security`, warning priority and above), and custom rules: shell in WordPress, summarizer or gateway pods; writes under `/var/www/html`; unexpected outbound connections from box 2.
+**Do:** `platform/falco/`: Falco with the **modern eBPF** driver (Talos doesn't allow kernel modules) and its **gVisor event source** for pods running under gVisor (step 6.5), Falcosidekick to Alertmanager, Grafana and Slack (`#rl-security`, warning priority and above), and custom rules: shell in WordPress, summarizer or gateway pods; writes under `/var/www/html`; unexpected outbound connections from box 2.
 - **Falco's own health:** Falco and Falcosidekick metrics with ServiceMonitors, and the alerts `FalcoNotRunning` (fewer ready Falco pods than nodes for 10 minutes; to `#rl-security` and `#rl-critical`), `FalcosidekickOutputErrors` and `FalcoEventsDropped` (to `#rl-security`), each with a runbook.
 
-**Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana and `#rl-security`; creating a file under `/var/www/html` triggers another; deleting the Falco pod on one node (or temporarily preventing it from scheduling there) fires `FalcoNotRunning` in `#rl-security` and `#rl-critical`; pointing Falcosidekick at a wrong Slack destination fires `FalcosidekickOutputErrors`.
+**Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana and `#rl-security` (and the same in a gVisor runner pod, through the gVisor event source); creating a file under `/var/www/html` triggers another; deleting the Falco pod on one node (or temporarily preventing it from scheduling there) fires `FalcoNotRunning` in `#rl-security` and `#rl-critical`; pointing Falcosidekick at a wrong Slack destination fires `FalcosidekickOutputErrors`.
 
 ### Step 10.2: Trivy Operator, Kubescape scan and Talos hardening notes
 **Do:** `platform/trivy-operator/` with modest scan concurrency (it's memory hungry on 8 GB); write `docs/talos-hardening.md` explaining how Talos meets the CIS benchmark (no shell or SSH, read-only system, API-only management, default pod security). Run the first **Kubescape CLI** scan of the home cluster from the workstation (NSA-CISA and MITRE ATT&CK frameworks, plus RBAC analysis; nothing installed in the cluster), save the report and a short summary of accepted findings in `docs/security/`, and fill in the baseline in `docs/adr/0003-kubescape-cli-not-operator.md`.
@@ -592,6 +604,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 6.2 Argo Rollouts | ☐ | | | |
 | 6.3 CiliumNetworkPolicies | ☐ | | | |
 | 6.4 Service mesh ADR (+ optional Istio experiment) | ☐ | | | |
+| 6.5 Sandboxed runtime (gVisor) | ☐ | | | |
 | 7.1 KEDA | ☐ | | | |
 | 7.2 LiteLLM gateway | ☐ | | | |
 | 7.3 Summarizer code | ☐ | | | |
