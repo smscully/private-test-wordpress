@@ -32,6 +32,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Encryption in transit | TLS on sensitive connections; Cilium WireGuard between nodes, if supported in chaining mode | TLS on sensitive connections; Cilium WireGuard between nodes |
 | Service mesh | None, by decision (ADR) | None, by decision (ADR) |
 | Logs | Loki + Alloy, 14-day retention (bucket in the always-on edge stack); control-plane audit logs in CloudWatch | Loki + Alloy, 7-day retention, including Talos system logs |
+| Traces | Tempo, on for every demo, 7-day retention (bucket in the always-on edge stack) | Tempo on demand, 3-day retention |
 | Network visibility | Hubble + Hubble UI (port-forward), metrics in Prometheus | Hubble + Hubble UI (Cloudflare Access), metrics in Prometheus |
 | AWS resource tags | `Project=russetleaf`, `Site=com` | `Project=russetleaf`, `Site=dev` |
 | Self-hosted model | llama.cpp (CUDA build) on a Karpenter GPU node | llama.cpp (CPU build) on box 2 |
@@ -534,7 +535,7 @@ Prometheus **scrapes** (pulls) metrics from HTTP endpoints; nothing pushes to it
 | Object cache | Hit ratio, memory, evictions | **redis_exporter** (works with Valkey) | ElastiCache metrics from CloudWatch |
 | Synthetic checks inside the cluster | Do key pages and the REST API respond correctly? | **blackbox_exporter** probing `/`, `/wp-login.php` and `/wp-json/` | Same |
 | WordPress itself | Application health | **Custom metrics plugin** (below) | Same |
-| Request traces (optional) | Which code or query is slow | OpenTelemetry PHP → Grafana Tempo (optional; costs memory) | Same, during demos |
+| Request traces | Which code or query is slow, and where a summary job spent its time | OpenTelemetry → Alloy → Tempo, **on demand** | Same, **on for every demo** |
 
 (If the image is ever switched from Apache to PHP-FPM + nginx, use **php-fpm_exporter** instead of apache_exporter.)
 
@@ -555,11 +556,11 @@ How it's built safely:
 - **Shipped with the chart:** the WordPress chart includes the apache_exporter sidecar, a `ServiceMonitor` for both the exporter and the metrics port, and `PrometheusRule` alerts with runbooks (`WordPressPostsMissingSummaries`, `WordPressCronBacklog`, `WordPressObjectCacheHitRatioLow`, `WordPressApacheWorkersSaturated`, `WordPressSyntheticProbeFailing`).
 - **Tested:** a unit test for the output format, and a ci test that scrapes the endpoint in the kind cluster.
 
-### Optional: request tracing
-OpenTelemetry's PHP auto-instrumentation (a PHP extension plus SDK, added to the image) can send traces of each request (PHP functions, database queries, outgoing calls) to **Grafana Tempo**, linked from Grafana dashboards. It's the most detailed view of slow requests, but Tempo costs memory box 1 doesn't have to spare, so it's **optional**: turn it on for investigations, or during AWS demos where memory isn't tight.
+### Request tracing
+Traces of page requests (and of the AI summary pipeline) are covered in [Tracing (Tempo + OpenTelemetry)](#tracing-tempo--opentelemetry): always on during russetleaf.com demos, on demand at home.
 
 ### Cost and memory
-$0. The exporters are small (roughly 20–50 MB each); the custom plugin adds nothing measurable. Only the optional Tempo tracing is expensive.
+$0. The exporters are small (roughly 20–50 MB each); the custom plugin adds nothing measurable. Only Tempo (see the tracing section) uses noticeable memory.
 
 ## Logging (Loki + Alloy)
 
@@ -595,6 +596,44 @@ Logs can contain visitors' IP addresses and occasionally email addresses. Short 
 ### Cost and memory
 - **Money:** a few cents a month per site for the S3 buckets.
 - **Memory:** Loki in single-binary mode is roughly 200–500 MB, Alloy about 100–200 MB per node. On box 1 that's tight; keep retention short, drop noise at the collector and keep labels few. Recorded in the box 1 memory budget.
+
+## Tracing (Tempo + OpenTelemetry)
+
+Traces show how a single request or job moved through the system: which services it touched, what each one did, and how long each step took. The project traces both **page requests** and the **AI summary pipeline** end to end. The reasoning is recorded in `docs/adr/0006-tempo-tracing.md`.
+
+### When tracing is on
+
+| | russetleaf.com (AWS) | russetleaf.dev (home) |
+|---|---|---|
+| Tempo running | **On for every demo**: EKS has memory to spare, and a live end-to-end trace is a strong demo | **Optional, on demand**: turned on while investigating, then removed if box 1's memory is tight |
+| Sampling | 100% of traces (demo traffic is low) | Parent-based, ~10% of page requests; 100% of summary jobs (they're rare) |
+| Retention | 7 days, in an S3 bucket in the always-on edge stack (so demo traces can be reviewed afterwards) | 3 days, in an S3 bucket |
+
+The instrumentation is **always built into the images**; it only sends traces when an OpenTelemetry endpoint is configured. Turning tracing on or off is a values change in the overlay, not a new image.
+
+### What's traced
+
+| Component | How it's instrumented | Spans it produces |
+|---|---|---|
+| **WordPress** | OpenTelemetry's **PHP extension** plus **Composer packages** (the SDK, the OTLP exporter, and auto-instrumentation packages for WordPress, database access and HTTP calls from the OpenTelemetry PHP contrib project; check current package names), installed at image build. **No WordPress plugin** is involved: it's enabled by environment variables (`OTEL_PHP_AUTOLOAD_ENABLED`, `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`, sampler settings) | The page request, WordPress hooks, database queries, outgoing calls (S3, SQS) |
+| **summary-queue must-use plugin** (custom) | Adds the current trace context (the W3C `traceparent` value) to each SQS message as a **message attribute** | The "queue summary" span |
+| **Post-summarizer** | OpenTelemetry's **Python SDK** with auto-instrumentation for boto3 and HTTP clients; reads `traceparent` from each SQS message and continues the trace | Receiving the message, reading the post, the gateway call, saving the summary |
+| **LiteLLM gateway** | LiteLLM's built-in **OpenTelemetry** support | Routing, fallback, and the model call, with attributes for the model used, tokens and latency |
+| **Model calls** | Covered by the gateway's spans (Bedrock and llama.cpp aren't instrumented themselves) | — |
+
+One trace then shows: a post is published → queued → picked up by the summarizer (possibly minutes later) → sent through the gateway → answered by a specific model → summary saved. Because the queue makes the pipeline asynchronous, the summarizer's spans are linked to the publish trace through the message's trace context.
+
+### Collection and storage
+- **Grafana Alloy** (already running on every node for logs) also receives traces over **OTLP** and forwards them to Tempo. No separate collector is needed.
+- **Grafana Tempo** in single-binary mode, storing traces in an **S3 bucket** per site, with a small local volume.
+- **Grafana correlation:** trace IDs are included in the services' log lines, so Grafana links **traces ↔ logs** (Loki) and **metrics → traces** (exemplars on latency graphs).
+
+### Privacy
+Spans record **metadata only**: model name, prompt version, token counts, durations, status. **Post content, prompts and generated summaries are not recorded** in spans (LiteLLM's message-content capture is turned off, and the summarizer doesn't add text as attributes).
+
+### Cost and memory
+- **Money:** a few cents a month per site for S3 storage.
+- **Memory:** Tempo in single-binary mode is roughly 200–500 MB (only while it's on at home); the instrumentation adds a little CPU per request when sending.
 
 ## Alerting and notifications (Slack)
 
@@ -809,6 +848,7 @@ These are approximate prices for **us-east-1**, on demand unless noted, for a sm
 | LiteLLM, ARC runners, KEDA, Argo Rollouts, Kyverno, Falco, Trivy Operator, OpenCost, Karpenter, Prometheus/Grafana | run on the existing worker nodes | $0 |
 | kube-bench | Job run on demand | $0 |
 | Loki log storage (S3) | 14-day retention, demo-hours volume | <$1 |
+| Tempo trace storage (S3) | 7-day retention, demo-hours volume | <$1 |
 | Alerting (SNS, Amazon Q Developer in chat applications, Slack free plan) | CloudWatch alarms and budget alerts to Slack | $0 |
 | **Total** | | **~$720–$820 / month** |
 
@@ -1020,7 +1060,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **Terraform for both sides, in one repo (`wp-infra`):** shared modules, plus separate root modules for russetleaf.com's always-on edge, its demo stack (including Karpenter and its NodePools), and the russetleaf.dev home lab (Talos provider `siderolabs/talos` for both nodes' machine configs, Cloudflare provider for the tunnel, DNS and WAF rules, and the AWS pieces used from home).
 - **CI on GitHub in every repo:** Terraform checks and plans in `wp-infra`; manifest validation and Kyverno policy tests in `wp-gitops`; image builds with SBOMs, scans and signing in `wp-image` and `llm-summarizer`; and the prompt evaluation gate in `llm-summarizer`. Employers see all of it without the AWS stack running.
 - **Environments and promotion:** local, ci (kind + LocalStack + mock LLM per pull request), on-demand scale-to-zero staging with scrubbed production data, and automated promotion to production after staging passes.
-- **Full observability on both sites:** metrics (Prometheus), logs (Loki + Alloy, with log-based alerts), network flows (Hubble), security events (Falco) and optional traces (Tempo), correlated in Grafana.
+- **Full observability on both sites:** metrics (Prometheus), logs (Loki + Alloy, with log-based alerts), network flows (Hubble), security events (Falco) and traces (Tempo, following each AI summary end to end through the SQS queue and model gateway), correlated in Grafana.
 - **Application-level monitoring:** exporters around WordPress (Apache, database, cache, synthetic probes) plus a custom metrics plugin with a business-level signal (`posts_without_summary`) tied to an alert and a runbook.
 - **Operational alerting:** alerts as code with tests and runbooks, routed to Slack by site and severity, with inhibition rules, a dead man's switch, external uptime checks and silences during demo teardown.
 - **Documentation:** architecture diagrams for both environments, the cost breakdown, Grafana dashboard screenshots, Slack alert screenshots, runbooks, sample evaluation reports comparing models, and demo recordings.
@@ -1068,7 +1108,8 @@ wp-gitops/
     runbooks/               # one page per alert: what it means, how to check, how to fix
     adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md,
                             #   0002-s3-media-not-efs.md, 0003-kubescape-cli-not-operator.md,
-                            #   0004-ghcr-not-ecr.md, 0005-loki-alloy-for-logs.md)
+                            #   0004-ghcr-not-ecr.md, 0005-loki-alloy-for-logs.md,
+                            #   0006-tempo-tracing.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
@@ -1113,7 +1154,9 @@ wp-gitops/
     trivy-operator/         # continuous CIS compliance, running-image vulnerability and config reports
     opencost/               # OpenCost (cost per namespace/workload/node)
     logging/                # Loki (single binary, S3 storage, ruler for log-based alerts) + Grafana Alloy
-                            #   DaemonSet (labels, noise dropping, masking; Talos log receiver at home)
+                            #   DaemonSet (labels, noise dropping, masking; Talos log receiver at home; OTLP
+                            #   receiver forwarding traces to Tempo)
+    tracing/                # Grafana Tempo (single binary, S3 storage); home: on demand, aws: always on
     karpenter/              # Karpenter general and GPU NodePools, EC2NodeClass (aws only)
     kube-bench/             # CIS benchmark Job, EKS profile (aws only)
     llm-gateway/            # LiteLLM + routing config: model list, fallbacks, canary weights, budgets
@@ -1140,7 +1183,7 @@ wp-infra/
                             #   IAM roles for each repo's CI (plan, apply, image push)
   modules/                  # reusable modules shared by both environments
     s3-media/               # media bucket, versioning, IAM policy
-    s3-logs/                # Loki log bucket: encryption, lifecycle matching retention, IAM policy
+    s3-logs/                # Loki log and Tempo trace buckets: encryption, lifecycle matching retention, IAM policy
     s3-backups/             # database backup bucket: versioning, encryption, lifecycle rules, IAM policy
     sqs-queue/              # queue + dead-letter queue + alarms
     secrets/                # Secrets Manager entries

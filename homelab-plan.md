@@ -160,7 +160,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) and `0005-loki-alloy-for-logs.md` (finish in step 4.6); move them with the other docs.
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) `0005-loki-alloy-for-logs.md` (finish in step 4.6) and `0006-tempo-tracing.md` (finish in step 10.4); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Checkov** to every repo's CI from the start, scanning the **GitHub Actions workflows** (unpinned actions, over-broad `permissions`, script injection), with a `.checkov.yaml` per repo. Later steps add each repo's other targets (Terraform, manifests, Dockerfiles, charts). Skips must carry a reason. See [Infrastructure and configuration scanning](aws-wp.md#infrastructure-and-configuration-scanning-checkov).
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
@@ -192,7 +192,7 @@ Record each answer in the [decision log](#decision-log).
 ### Step 2.3: AWS and Cloudflare resources for the home lab
 **Do** (`wp-infra/modules/` + `envs/home/`):
 - Modules: `s3-media`, `s3-backups`, `sqs-queue` (with dead-letter queue), `secrets`, `bedrock-access`.
-- russetleaf.dev resources: media bucket, database-backup bucket (lifecycle: expire after 30 days), **model mirror bucket** (for the self-hosted model's file, used in step 8.1), **Loki log bucket** (lifecycle: expire after 7 days, used in step 4.6, plus a scoped IAM key for Loki), summary queue + dead-letter queue, Secrets Manager entries (empty placeholders; values set by hand or generated), Bedrock budget alert.
+- russetleaf.dev resources: media bucket, database-backup bucket (lifecycle: expire after 30 days), **model mirror bucket** (for the self-hosted model's file, used in step 8.1), **Loki log bucket** (lifecycle: expire after 7 days, used in step 4.6, plus a scoped IAM key for Loki), **Tempo trace bucket** (lifecycle: expire after 3 days, used in step 10.4, with its own scoped key), summary queue + dead-letter queue, Secrets Manager entries (empty placeholders; values set by hand or generated), Bedrock budget alert.
 - **Staging resources** (a second, smaller set of the same modules, tagged `Env=staging`): staging media bucket, summary queue + dead-letter queue, Secrets Manager entries, and a scoped IAM key that can **read** the production backup bucket but write only to staging resources. Used from step 5.6.
 - **Email:** an SES domain identity for russetleaf.dev, with its DKIM and SPF records created in Cloudflare, and SES SMTP credentials stored in Secrets Manager. (New SES accounts are in the "sandbox" and can only send to verified addresses; verify your own address for testing, or request production access.)
 - Scoped IAM users and keys for the home cluster, one per job: External Secrets (read the russetleaf.dev secrets only), WordPress (media bucket + send to queue), MariaDB backups (backup bucket), summarizer (read from queue), LiteLLM (`bedrock:InvokeModel` on the chosen models only). Store each key in Secrets Manager.
@@ -268,7 +268,7 @@ Check `kubectl top nodes` after each step.
 ### Step 4.6: Logging (Loki + Alloy)
 **Do:** `platform/logging/`, as described in `aws-wp.md` ([Logging](aws-wp.md#logging-loki--alloy)):
 - **Loki** in single-binary mode, storing data in the Loki S3 bucket (scoped key from External Secrets), a small local cache volume, **7-day retention**, the **ruler** sending alerts to Alertmanager.
-- **Grafana Alloy** DaemonSet: collect all container logs; labels `site=dev`, `env`, `cluster`, `namespace`, `app`, `container` only; drop debug lines and health-check access logs; mask tokens and passwords in query strings; a host port receiving **Talos system logs**.
+- **Grafana Alloy** DaemonSet: an **OTLP receiver** for traces (forwarding to Tempo once it exists; until then traces are dropped); collect all container logs; labels `site=dev`, `env`, `cluster`, `namespace`, `app`, `container` only; drop debug lines and health-check access logs; mask tokens and passwords in query strings; a host port receiving **Talos system logs**.
 - In `wp-infra/envs/home`, point Talos's machine logging at Alloy's host port on each node.
 - A narrow Kyverno **`PolicyException`** for Alloy (host paths for log files, the host port).
 - Loki as a Grafana data source, with links from dashboards to logs; starter log-based alerts (`LokiIngestionErrors` now; the WordPress, summarizer and Bedrock ones are added in steps 5.2 and 7.5) with runbooks.
@@ -290,7 +290,8 @@ Check `kubectl top nodes` after each step.
 - `wp-config` settings read from environment variables (database, Valkey, S3, queue URL, `WP_HOME`/`WP_SITEURL`, `DISALLOW_FILE_MODS`, `DISABLE_WP_CRON`), with **TLS to the database** turned on.
 - A **`db.php` drop-in** whose behaviour is chosen by the chart setting **`database.auth`**. Build only the **`password`** mode now (reads the password from a Secret, connects over TLS); it's what the home lab uses, and it's the AWS fallback too. Leave a clear extension point for an **`iam`** mode, which is written **only after** the AWS plan's early test (step 1.6) shows that PHP can log in to RDS Proxy with an IAM token. That way no work is wasted if the test fails. Add the **RDS CA certificate bundle** to the image now (harmless at home, needed on AWS).
 - The **metrics must-use plugin** (`mu-plugins/metrics/`), as described in `aws-wp.md` ([WordPress monitoring](aws-wp.md#wordpress-monitoring)): `wordpress_posts_without_summary`, `wordpress_cron_overdue_events`, `wordpress_object_cache_hit_ratio`, `wordpress_info`, and simple counts, served on a **separate internal port** (a second Apache listener, e.g. 9117), cached for about a minute. Also turn on Apache's `mod_status`, reachable from localhost only (for the apache_exporter sidecar). Unit-test the output format.
-- The **summary-queue must-use plugin**: on publish or update, send `{"post_id": ...}` to SQS (AWS SDK for PHP, installed with Composer at build time).
+- **OpenTelemetry tracing, built in but off by default:** the OpenTelemetry **PHP extension** and **Composer packages** (SDK, OTLP exporter, and auto-instrumentation for WordPress, database access and HTTP calls; check current package names in the OpenTelemetry PHP contrib project). **No WordPress plugin** is needed; it's switched on by environment variables (`OTEL_PHP_AUTOLOAD_ENABLED`, `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`, sampler settings) set in the chart values. Include trace IDs in WordPress's log lines.
+- The **summary-queue must-use plugin**: on publish or update, send `{"post_id": ...}` to SQS, adding the current trace context (W3C `traceparent`) as a **message attribute** when tracing is on (AWS SDK for PHP, installed with Composer at build time).
 - `tests/`: a smoke test (Docker Compose with MariaDB: the container starts, plugins are active, health check passes).
 - `chart/`: the WordPress Helm chart (see step 5.2 for what it deploys), versioned with the image.
 - CI: **Checkov on the Dockerfile and the chart**, build, SBOM (Syft), scan (Trivy, failing on critical vulnerabilities), sign (cosign keyless), **attach the SBOM as a signed attestation** (`cosign attest`, SPDX JSON), push the image and the chart (OCI) to GHCR with an immutable version.
@@ -405,7 +406,7 @@ Review the policy reports, fix violations, then switch to **enforce**.
 **Test:** a test `ScaledObject` scales a dummy Deployment from 0 to 1 when a message is sent to a test queue, and back to 0 when the queue is empty.
 
 ### Step 7.2: LiteLLM gateway
-**Do:** `platform/llm-gateway/`: LiteLLM with Claude Haiku (default) and Amazon Nova Lite on Bedrock, using the scoped Bedrock key; per-app budgets and rate limits (a separate key and small budget for staging); metrics exposed to Prometheus; an internal API key for callers.
+**Do:** `platform/llm-gateway/`: LiteLLM (with its OpenTelemetry tracing configured but pointed at Alloy only when tracing is on, and message-content capture **off**) with Claude Haiku (default) and Amazon Nova Lite on Bedrock, using the scoped Bedrock key; per-app budgets and rate limits (a separate key and small budget for staging); metrics exposed to Prometheus; an internal API key for callers.
 
 **Test:** from a test pod, an OpenAI-style chat request to the gateway returns answers from both models; requests over the rate limit are refused; the gateway's metrics appear in Prometheus.
 
@@ -413,7 +414,8 @@ Review the policy reports, fix violations, then switch to **enforce**.
 **Do:**
 - A dedicated WordPress user for the summarizer (role: editor or a custom role that can edit posts only), with an **application password** created by `wp-cli` and stored in Secrets Manager.
 - `src/`: SQS consumer (long polling, delete only after success, retries then dead-letter queue), WordPress adapter (REST API with that application password, calling WordPress's in-cluster Service rather than going out through Cloudflare: read the post, write the summary to the excerpt or a custom field), OpenAI-compatible model client pointed at the gateway, prompt loading from `prompts/` with the version recorded alongside each summary.
-- Unit tests (adapter and consumer with mocks).
+- **OpenTelemetry tracing** with the Python SDK (auto-instrumentation for boto3 and HTTP clients), built in and off unless an OTLP endpoint is configured: read `traceparent` from each SQS message and continue the trace; spans for reading the post, calling the gateway and saving the summary; metadata attributes only (model, prompt version, tokens), **never post text, prompts or summaries**; trace IDs in log lines.
+- Unit tests (adapter and consumer with mocks, including trace-context extraction).
 - `demo/`: Docker Compose with sample posts and a small mock WordPress endpoint, calling Bedrock through a local LiteLLM, so anyone can run it without Kubernetes.
 
 **Test:** unit tests pass; `docker compose up` in `demo/` produces summaries for the sample posts.
@@ -487,10 +489,10 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 **Test:** OpenCost shows cost per namespace, with box 2 attributed to the LLM namespace.
 
 
-### Step 10.4 (optional): Request tracing
-**Do:** add OpenTelemetry's PHP auto-instrumentation (PHP extension and SDK) to the WordPress image, switched off by default with an environment variable; install **Grafana Tempo** (single-binary, small retention) only while investigating; link traces from Grafana. Record the memory cost in the decision log.
+### Step 10.4 (optional, on demand): Tracing with Tempo
+**Do:** `platform/tracing/`: **Grafana Tempo** in single-binary mode, storing traces in the Tempo bucket (scoped key from External Secrets), **3-day retention**; Tempo as a Grafana data source with links to Loki (trace ID in log lines) and exemplars on latency graphs. Point Alloy's OTLP receiver at Tempo, and turn tracing on in the WordPress, summarizer and gateway values: parent-based sampling of ~10% for page requests, 100% for summary jobs. When finished investigating, turn it off and remove Tempo if box 1's memory is tight (the Argo CD Application can be suspended). See `aws-wp.md` ([Tracing](aws-wp.md#tracing-tempo--opentelemetry)). Record memory use and the sampling rates in `docs/adr/0006-tempo-tracing.md`.
 
-**Test:** with tracing on, a slow page's trace shows its database queries and outgoing calls in Grafana; with it off, there's no measurable overhead; Tempo is removed afterwards if memory is tight.
+**Test:** publishing a post produces **one trace** in Grafana covering WordPress → the queue message → the summarizer → the gateway → the model call → saving the summary, showing which model answered; a slow page's trace shows its database queries; clicking a trace opens its logs in Loki; no span contains post text, prompts or summaries; with tracing off, nothing is sent and there's no measurable overhead.
 
 ## Phase 11: Optional and finishing
 
@@ -579,7 +581,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 10.1 Falco | ☐ | | | |
 | 10.2 Trivy Operator, Kubescape scan, Talos notes | ☐ | | | |
 | 10.3 OpenCost | ☐ | | | |
-| 10.4 Request tracing (optional) | ☐ | | | |
+| 10.4 Tracing with Tempo (optional, on demand) | ☐ | | | |
 | 11.1 Keyless AWS access (optional) | ☐ | | | |
 | 11.2 Docs + go public | ☐ | | | |
 

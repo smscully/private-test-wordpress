@@ -73,7 +73,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Route 53 hosted zone for russetleaf.com (point the registrar's name servers at it if needed).
 - ACM certificates: `russetleaf.com` + `www` in us-east-1 (CloudFront), and `origin.russetleaf.com` in the ALB's region (the same region if you chose us-east-1).
-- S3 offline-page bucket with the offline page ("The AWS demo is offline. Visit russetleaf.dev."), the russetleaf.com **media bucket**, a **model mirror bucket** (the self-hosted model's file, so demo startup doesn't depend on Hugging Face), and a **Loki log bucket** (14-day lifecycle; kept in the always-on stack so demo logs can be reviewed after teardown). Origin Access Control on all of them.
+- S3 offline-page bucket with the offline page ("The AWS demo is offline. Visit russetleaf.dev."), the russetleaf.com **media bucket**, a **model mirror bucket** (the self-hosted model's file, so demo startup doesn't depend on Hugging Face), a **Loki log bucket** (14-day lifecycle) and a **Tempo trace bucket** (7-day lifecycle), both kept in the always-on stack so demo logs and traces can be reviewed after teardown. Origin Access Control on all of them.
 - CloudFront distribution: default behavior → `origin.russetleaf.com` (all methods, HTTPS only, the `X-Origin-Verify` secret header, Host not forwarded); `/wp-content/uploads/*` → media bucket; `/offline/*` → offline bucket; custom error responses 502/503/504 → `/offline/index.html` with status 503; 10-second error caching; origin timeout 2 s, 1 attempt.
 - The secret header value in Secrets Manager.
 - SES domain identity for russetleaf.com, with DKIM records in Route 53.
@@ -166,6 +166,7 @@ Record each answer in the [decision log](#decision-log).
 - KEDA: Pod Identity for the SQS scaler.
 - Argo Rollouts: an `AnalysisTemplate` variant using **CloudWatch** (ALB 5xx rate and target response time) instead of ingress-nginx metrics.
 - **Logging:** `platform/logging/overlays/aws`: Loki (S3 via a Pod Identity role on the russetleaf.com log bucket, 14-day retention) and Alloy with `site=com`; no Talos log receiver; the EKS control-plane audit logs stay in CloudWatch. Alloy gets the same narrow Kyverno exception as at home.
+- **Tracing:** `platform/tracing/overlays/aws`: Tempo (S3 via a Pod Identity role on the trace bucket, 7-day retention), **always on**; Alloy's OTLP receiver forwards to it; tracing turned on in the WordPress, summarizer and gateway values with **100% sampling**.
 - Falco: modern eBPF on AL2023, same custom rules; Falcosidekick to `#rl-security`.
 - Kyverno's Policy Reporter and Argo Rollouts notifications: same Slack setup as home, prefixed `[com]`.
 - Trivy Operator, OpenCost (with AWS on-demand/spot pricing).
@@ -218,6 +219,11 @@ Record each answer in the [decision log](#decision-log).
 
 **Test:** the report compares the same models on CPU (home) and GPU (AWS), including latency and cost per summary.
 
+
+### Step 4.4: End-to-end tracing on EKS
+**Do:** with Tempo running (step 2.4), publish a post on russetleaf.com and follow its trace in Grafana from WordPress through SQS, the summarizer and the gateway to the model call (Bedrock or the GPU model) and back. Save a screenshot for the docs and demo script, and fill in the AWS open item in `docs/adr/0006-tempo-tracing.md`.
+
+**Test:** one trace covers the whole pipeline and shows which model answered and each step's duration; traces from a demo are still viewable after `demo-down` (they're in the always-on trace bucket); no span contains post text, prompts or summaries.
 ## Phase 5: Security and cost review
 
 ### Step 5.1: Security review
@@ -246,7 +252,7 @@ Record each answer in the [decision log](#decision-log).
 **Test:** run `demo-up` and `demo-down` end to end twice without manual steps, and confirm the teardown produces **no** alert noise in Slack (only the "stopped" message); force the safety net by lowering the limit.
 
 ### Step 6.2: Full rehearsal and demo script
-**Do:** write `docs/demo-script.md`: what to show and in what order (offline page → `demo-up` → live site → publish a post and watch the summary → Grafana LLM dashboard → Argo Rollouts canary → Kyverno rejecting an unsigned image → Falco alert → OpenCost → `demo-down` → offline page). Rehearse, then record a walkthrough.
+**Do:** write `docs/demo-script.md`: what to show and in what order (offline page → `demo-up` → live site → publish a post and watch the summary → its end-to-end trace in Tempo → Grafana LLM dashboard → Argo Rollouts canary → Kyverno rejecting an unsigned image → Falco alert → OpenCost → `demo-down` → offline page). Rehearse, then record a walkthrough.
 
 **Test:** a complete demo runs in under an hour of stack time, and the recording is linked from the hub README.
 
@@ -294,6 +300,7 @@ Record each answer in the [decision log](#decision-log).
 | 4.1 Summarizer + gateway | ☐ | | | |
 | 4.2 GPU model server | ☐ | | | |
 | 4.3 Evaluation on AWS | ☐ | | | |
+| 4.4 End-to-end tracing | ☐ | | | |
 | 5.1 Security review | ☐ | | | |
 | 5.2 Cost review | ☐ | | | |
 | 5.3 Istio ambient experiment (optional) | ☐ | | | |
