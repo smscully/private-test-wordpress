@@ -83,6 +83,7 @@ Tools to pin (check each name with `mise registry | grep <tool>`; pin `kubectl` 
 | `cilium`, `hubble` | Cilium status and connectivity tests; Hubble flow queries |
 | `kyverno` | Policy tests |
 | `cosign`, `syft`, `trivy` | Image signing, SBOMs, scanning |
+| `kubescape` | On-demand cluster posture scans (NSA-CISA, MITRE ATT&CK, RBAC) |
 | `gh` | GitHub CLI |
 | `awscli` (v2) | AWS |
 | `uv` | Python tooling (the summarizer, Checkov, pre-commit, LocalStack CLI) |
@@ -159,7 +160,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and two ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4) and `0002-s3-media-not-efs.md` (finish in step 5.1); move them with the other docs.
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Checkov** to every repo's CI from the start, scanning the **GitHub Actions workflows** (unpinned actions, over-broad `permissions`, script injection), with a `.checkov.yaml` per repo. Later steps add each repo's other targets (Terraform, manifests, Dockerfiles, charts). Skips must carry a reason. See [Infrastructure and configuration scanning](aws-wp.md#infrastructure-and-configuration-scanning-checkov).
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
@@ -459,10 +460,10 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 
 **Test:** `kubectl exec` into a WordPress pod triggers an alert in Grafana and `#rl-security`; creating a file under `/var/www/html` triggers another.
 
-### Step 10.2: Trivy Operator and Talos hardening notes
-**Do:** `platform/trivy-operator/` with modest scan concurrency (it's memory hungry on 8 GB); write `docs/talos-hardening.md` explaining how Talos meets the CIS benchmark (no shell or SSH, read-only system, API-only management, default pod security).
+### Step 10.2: Trivy Operator, Kubescape scan and Talos hardening notes
+**Do:** `platform/trivy-operator/` with modest scan concurrency (it's memory hungry on 8 GB); write `docs/talos-hardening.md` explaining how Talos meets the CIS benchmark (no shell or SSH, read-only system, API-only management, default pod security). Run the first **Kubescape CLI** scan of the home cluster from the workstation (NSA-CISA and MITRE ATT&CK frameworks, plus RBAC analysis; nothing installed in the cluster), save the report and a short summary of accepted findings in `docs/security/`, and fill in the baseline in `docs/adr/0003-kubescape-cli-not-operator.md`.
 
-**Test:** vulnerability and compliance reports exist for the running workloads; the hardening doc is reviewed.
+**Test:** vulnerability and compliance reports exist for the running workloads; the hardening doc is reviewed; the Kubescape report is committed, and any high-risk RBAC findings (e.g. a service account that can read all Secrets cluster-wide) are fixed or explained.
 
 ### Step 10.3: OpenCost
 **Do:** `platform/opencost/` using the existing Prometheus, with custom prices for the home hardware (electricity per node) and the Bedrock spend shown alongside.
@@ -500,6 +501,7 @@ These keep russetleaf.dev healthy once it's running. Add each as a calendar remi
 | Check for Terraform drift | Weekly | A scheduled `terraform plan` in `wp-infra` CI for the AWS and Cloudflare resources (alerts if anything changed outside Terraform) |
 | Check staging still works | Monthly, if nothing has been promoted | Run `staging-test` by hand, so a broken staging setup is found before it blocks a real release |
 | Check the staging scrub | After any plugin that stores personal data is added | Confirm the `staging-data` Job also clears that plugin's tables |
+| Kubescape posture scan | Monthly | Run the Kubescape CLI against the home cluster; save the report in `docs/security/`; compare scores with the previous run and investigate any drop |
 | Rotate MariaDB passwords | Quarterly | Regenerate the operator-managed Secret (or use the operator's rotation feature), then restart WordPress through its Rollout; check the backup user still works |
 | Rotate scoped IAM keys | Every 90 days, until step 11.1 removes them | Create a new key in Terraform, update Secrets Manager, let External Secrets sync it, delete the old key |
 | Review alerts, costs and Bedrock spend | Monthly | Grafana, OpenCost, the AWS Budget and Cost Explorer (filter by `Site=dev`) |
@@ -557,7 +559,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 9.2 Runners for `llm-summarizer` | ☐ | | | |
 | 9.3 Evaluation gate + releases | ☐ | | | |
 | 10.1 Falco | ☐ | | | |
-| 10.2 Trivy Operator + Talos notes | ☐ | | | |
+| 10.2 Trivy Operator, Kubescape scan, Talos notes | ☐ | | | |
 | 10.3 OpenCost | ☐ | | | |
 | 10.4 Request tracing (optional) | ☐ | | | |
 | 11.1 Keyless AWS access (optional) | ☐ | | | |

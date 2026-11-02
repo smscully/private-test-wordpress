@@ -171,10 +171,12 @@ Record each answer in the [decision log](#decision-log).
 
 **Test:** each component is healthy; the home lab's Kyverno rejection tests (unsigned image, unlisted registry, `:latest`, missing labels or memory limit, privileged, root, writable root filesystem, no probes, NodePort/LoadBalancer Service, duplicate Ingress host) all still fail on EKS; OpenCost shows EC2 costs for the nodes.
 
-### Step 2.5: kube-bench
-**Do:** `platform/kube-bench/`: a Job using the **EKS CIS benchmark** profile, with results saved to `docs/` in `wp-gitops` (e.g. `docs/kube-bench-eks-<date>.txt`) and a short summary of any failures and why they're accepted or fixed.
+### Step 2.5: kube-bench and Kubescape scan
+**Do:**
+- `platform/kube-bench/`: a Job using the **EKS CIS benchmark** profile (node and control-plane configuration), with results saved to `docs/` in `wp-gitops` (e.g. `docs/kube-bench-eks-<date>.txt`) and a short summary of any failures and why they're accepted or fixed.
+- A **Kubescape CLI** scan of the EKS cluster from the workstation (NSA-CISA and MITRE ATT&CK frameworks, plus RBAC analysis; nothing installed in the cluster), saved in `docs/security/` with a summary, and compared with the home cluster's scores. Fill in the EKS open item in `docs/adr/0003-kubescape-cli-not-operator.md`.
 
-**Test:** the Job completes; the report is committed with a summary.
+**Test:** the Job completes and both reports are committed with summaries; any differences between the home and EKS Kubescape scores are explained (e.g. AWS-managed components).
 
 ## Phase 3: WordPress on russetleaf.com
 
@@ -218,7 +220,7 @@ Record each answer in the [decision log](#decision-log).
 ## Phase 5: Security and cost review
 
 ### Step 5.1: Security review
-**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); pod traffic between nodes is encrypted (WireGuard), or the ADR explains why not; CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench report committed.
+**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); pod traffic between nodes is encrypted (WireGuard), or the ADR explains why not; CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench and Kubescape reports committed for this demo.
 
 **Test:** a written checklist in `docs/` with each item checked.
 
@@ -263,6 +265,7 @@ Record each answer in the [decision log](#decision-log).
 | Check for leftovers | After each demo | Search for resources tagged `Stack=demo`; the Budget and Cost Anomaly alerts in `#rl-costs` are the backstop |
 | Review russetleaf.com alert noise | After each demo | Anything that fired during the demo should have been real; tune or remove alerts that weren't |
 | Rotate the CloudFront-to-ALB secret header | Every few months | Change the value in `envs/aws-edge`; the next demo picks it up |
+| Kubescape posture scan | Once per demo | Run the Kubescape CLI against EKS during the demo; save the report in `docs/security/` |
 | Review costs | After each demo | Cost Explorer filtered by `Site=com`, compared with the demo hours recorded |
 
 ## Progress checklist
@@ -284,7 +287,7 @@ Record each answer in the [decision log](#decision-log).
 | 2.2 Load Balancer Controller, ExternalDNS, storage | ☐ | | | |
 | 2.3 Karpenter NodePools + NVIDIA plugin | ☐ | | | |
 | 2.4 Shared platform overlays | ☐ | | | |
-| 2.5 kube-bench | ☐ | | | |
+| 2.5 kube-bench + Kubescape scan | ☐ | | | |
 | 3.1 WordPress AWS overlay | ☐ | | | |
 | 3.2 Seed + snapshot cycle | ☐ | | | |
 | 4.1 Summarizer + gateway | ☐ | | | |
