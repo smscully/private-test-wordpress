@@ -227,7 +227,7 @@ Record each answer in the [decision log](#decision-log).
 ## Phase 5: Security and cost review
 
 ### Step 5.1: Security review
-**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); pod traffic between nodes is encrypted (WireGuard), or the ADR explains why not; CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench and Kubescape reports committed for this demo.
+**Do:** confirm and document: the ALB rejects non-CloudFront traffic; RDS, RDS Proxy and Valkey aren't reachable from outside the VPC; no application holds a database password (IAM tokens through the proxy), and the master password is RDS-managed and rotating; no pod has an AWS key (Pod Identity everywhere); pod traffic between nodes is encrypted (WireGuard), or the ADR explains why not; CiliumNetworkPolicies enforce (from a WordPress pod, `curl https://example.com` is blocked; `hubble observe --verdict DROPPED` shows only expected drops); Kyverno enforces; Falco alerts fire on EKS (repeat the home lab's `kubectl exec` test); Trivy Operator reports; kube-bench and Kubescape reports committed for this demo; a **Prowler** run (the `wp-infra` workflow from home plan step 10.5, triggered by hand) with the demo stack up, covering EKS, RDS, ElastiCache, the ALB and the rest of `envs/aws`, with findings fixed in Terraform or explained (fill in the AWS open item in `docs/adr/0007-prowler-not-threatmapper.md`).
 
 **Test:** a written checklist in `docs/` with each item checked.
 
@@ -272,6 +272,7 @@ Record each answer in the [decision log](#decision-log).
 | Check for leftovers | After each demo | Search for resources tagged `Stack=demo`; the Budget and Cost Anomaly alerts in `#rl-costs` are the backstop |
 | Review russetleaf.com alert noise | After each demo | Anything that fired during the demo should have been real; tune or remove alerts that weren't |
 | Rotate the CloudFront-to-ALB secret header | Every few months | Change the value in `envs/aws-edge`; the next demo picks it up |
+| Prowler AWS scan with the stack up | Once per demo | Trigger the `wp-infra` Prowler workflow during the demo; review findings for the demo resources |
 | Kubescape posture scan | Once per demo | Run the Kubescape CLI against EKS during the demo; save the report in `docs/security/` |
 | Review costs | After each demo | Cost Explorer filtered by `Site=com`, compared with the demo hours recorded |
 

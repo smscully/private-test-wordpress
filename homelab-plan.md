@@ -84,6 +84,7 @@ Tools to pin (check each name with `mise registry | grep <tool>`; pin `kubectl` 
 | `kyverno` | Policy tests |
 | `cosign`, `syft`, `trivy` | Image signing, SBOMs, scanning |
 | `kubescape` | On-demand cluster posture scans (NSA-CISA, MITRE ATT&CK, RBAC) |
+| `prowler` (installed with `uv`) | AWS account posture scans (CIS AWS Foundations); also runs in CI |
 | `gh` | GitHub CLI |
 | `awscli` (v2) | AWS |
 | `uv` | Python tooling (the summarizer, Checkov, pre-commit, LocalStack CLI) |
@@ -160,7 +161,7 @@ Record each answer in the [decision log](#decision-log).
 **Do:**
 - Rename this repo to **`wp-gitops`**. Create **`wp-infra`**, **`wp-image`** and **`llm-summarizer`**.
 - In each: a README stub, `.gitignore` (Terraform state, `.terraform/`, kubeconfig, talosconfig, `.env`), a `LICENSE` if public, branch protection on `main` (pull requests and passing checks required).
-- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) `0005-loki-alloy-for-logs.md` (finish in step 4.6) and `0006-tempo-tracing.md` (finish in step 10.4); move them with the other docs.
+- In `wp-gitops`: a `docs/adr/` folder for **architecture decision records**, with a short template (context, decision, alternatives, consequences, when to revisit). Record the big step 0.2 decisions there as ADRs, and link them from the decision log. The template (`0000-template.md`) and three ADRs already exist as drafts in this repo's `docs/adr/`: `0001-no-service-mesh.md` (finish in step 6.4), `0002-s3-media-not-efs.md` (finish in step 5.1) and `0003-kubescape-cli-not-operator.md` (finish in step 10.2) and `0004-ghcr-not-ecr.md` (finish in step 5.1) `0005-loki-alloy-for-logs.md` (finish in step 4.6) and `0006-tempo-tracing.md` (finish in step 10.4) and `0007-prowler-not-threatmapper.md` (finish in step 10.5); move them with the other docs.
 - Add a pre-commit or CI secret scan (`gitleaks`) to every repo.
 - Add **Checkov** to every repo's CI from the start, scanning the **GitHub Actions workflows** (unpinned actions, over-broad `permissions`, script injection), with a `.checkov.yaml` per repo. Later steps add each repo's other targets (Terraform, manifests, Dockerfiles, charts). Skips must carry a reason. See [Infrastructure and configuration scanning](aws-wp.md#infrastructure-and-configuration-scanning-checkov).
 - Add **Renovate** to every repo (Helm charts, Terraform providers, base images, GitHub Actions).
@@ -173,7 +174,7 @@ Record each answer in the [decision log](#decision-log).
 ### Step 2.1: Bootstrap (state bucket and CI roles)
 **Do** (`wp-infra/bootstrap/`, applied locally):
 - S3 bucket for Terraform state: versioning, encryption, public access blocked. Backends use `use_lockfile = true`.
-- GitHub OIDC provider in IAM, plus roles for `wp-infra` CI: a read-only **plan** role (pull requests) and an **apply** role (`main` only).
+- GitHub OIDC provider in IAM, plus roles for `wp-infra` CI: a read-only **plan** role (pull requests), an **apply** role (`main` only), and a read-only **audit** role for Prowler (AWS's `SecurityAudit` and `ViewOnlyAccess` managed policies; used in step 10.5).
 - The AWS Budget alert (import the one from step 0.1 or recreate it).
 
 **Test:** a scratch root module with the S3 backend runs `terraform init` and `plan`; a GitHub Actions job in `wp-infra` assumes the plan role and runs `aws sts get-caller-identity`.
@@ -495,6 +496,11 @@ Then turn on the **`WordPressPostsMissingSummaries`** alert (from the custom met
 
 **Test:** publishing a post produces **one trace** in Grafana covering WordPress → the queue message → the summarizer → the gateway → the model call → saving the summary, showing which model answered; a slow page's trace shows its database queries; clicking a trace opens its logs in Loki; no span contains post text, prompts or summaries; with tracing off, nothing is sent and there's no measurable overhead.
 
+### Step 10.5: AWS account posture (Prowler)
+**Do:** a GitHub Actions workflow in `wp-infra`, **scheduled monthly** and runnable by hand, that assumes the read-only **audit role** (step 2.1) through GitHub OIDC and runs **Prowler** against the AWS account (CIS AWS Foundations and AWS Foundational Security Best Practices). Keep the full report as a workflow artifact, commit a summary to `wp-gitops/docs/security/` (failed checks by severity, plus accepted findings with reasons), and post the counts of failed high and critical checks to `#rl-security`. Fix what's worth fixing in Terraform (not by hand). Record the first run's baseline in `docs/adr/0007-prowler-not-threatmapper.md`. See `aws-wp.md` ([Runtime security and compliance](aws-wp.md#runtime-security-and-compliance)).
+
+**Test:** the workflow runs without stored AWS keys; a deliberately weakened setting (e.g. turning off S3 Block Public Access on a test bucket) shows up as a failed check, then passes once reverted; the summary and Slack message appear.
+
 ## Phase 11: Optional and finishing
 
 ### Step 11.1 (optional): Keyless AWS access for pods
@@ -520,6 +526,7 @@ These keep russetleaf.dev healthy once it's running. Add each as a calendar remi
 | Check for Terraform drift | Weekly | A scheduled `terraform plan` in `wp-infra` CI for the AWS and Cloudflare resources (alerts if anything changed outside Terraform) |
 | Check staging still works | Monthly, if nothing has been promoted | Run `staging-test` by hand, so a broken staging setup is found before it blocks a real release |
 | Check the staging scrub | After any plugin that stores personal data is added | Confirm the `staging-data` Job also clears that plugin's tables |
+| Prowler AWS account scan | Monthly (automatic) | Review the workflow's summary and Slack message; fix new failures in Terraform or record why they're accepted |
 | Kubescape posture scan | Monthly | Run the Kubescape CLI against the home cluster; save the report in `docs/security/`; compare scores with the previous run and investigate any drop |
 | Rotate MariaDB passwords | Quarterly | Regenerate the operator-managed Secret (or use the operator's rotation feature), then restart WordPress through its Rollout; check the backup user still works |
 | Rotate scoped IAM keys | Every 90 days, until step 11.1 removes them | Create a new key in Terraform, update Secrets Manager, let External Secrets sync it, delete the old key |
@@ -583,6 +590,7 @@ The home lab already builds most of what these need: the shared Terraform module
 | 10.2 Trivy Operator, Kubescape scan, Talos notes | ☐ | | | |
 | 10.3 OpenCost | ☐ | | | |
 | 10.4 Tracing with Tempo (optional, on demand) | ☐ | | | |
+| 10.5 AWS account posture (Prowler) | ☐ | | | |
 | 11.1 Keyless AWS access (optional) | ☐ | | | |
 | 11.2 Docs + go public | ☐ | | | |
 
