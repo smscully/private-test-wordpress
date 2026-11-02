@@ -31,6 +31,7 @@ The two sites are **fully independent**: each has its own URL, database, cache, 
 | Network policies | **CiliumNetworkPolicies** (default-deny, DNS-name egress rules), enforced by Cilium | **CiliumNetworkPolicies**, same base policies |
 | Encryption in transit | TLS on sensitive connections; Cilium WireGuard between nodes, if supported in chaining mode | TLS on sensitive connections; Cilium WireGuard between nodes |
 | Service mesh | None, by decision (ADR) | None, by decision (ADR) |
+| Admin sign-in | Google (OIDC) in WordPress, behind the ALB's OIDC rule on admin paths | Google (OIDC) in WordPress, behind Cloudflare Access on admin paths |
 | Logs | Loki + Alloy, 14-day retention (bucket in the always-on edge stack); control-plane audit logs in CloudWatch | Loki + Alloy, 7-day retention, including Talos system logs |
 | Traces | Tempo, on for every demo, 7-day retention (bucket in the always-on edge stack) | Tempo on demand, 3-day retention |
 | Network visibility | Hubble + Hubble UI (port-forward), metrics in Prometheus | Hubble + Hubble UI (Cloudflare Access), metrics in Prometheus |
@@ -134,6 +135,7 @@ MariaDB         Valkey          Amazon SQS ──► Post-summarizer pods (KEDA:
   - WordPress may write to its S3 bucket, send to the queue, and `rds-db:connect` as the `wordpress` user through RDS Proxy.
   - The summarizer may read from the queue; it reaches models only through the gateway.
   - The LLM gateway may call `bedrock:InvokeModel` on the chosen Bedrock models only.
+- **No human WordPress passwords:** admins sign in with Google (OIDC), and the admin area sits behind Cloudflare Access (home) or the ALB's OIDC rule (AWS); see [Admin sign-in with Google](#admin-sign-in-with-google).
 - **No application database password on russetleaf.com:** WordPress logs in to RDS Proxy with IAM auth tokens; the master password is generated and rotated by RDS. At home, MariaDB Operator generates and rotates the passwords. See [Database access and credentials](#database-access-and-credentials).
 - Other secrets (API tokens, SMTP credentials, the Slack token) in **AWS Secrets Manager**, synced into the cluster by **External Secrets Operator**.
 - **Encryption in transit:** TLS on every sensitive connection, plus Cilium's **WireGuard** encryption for pod traffic between nodes. No service mesh, by a recorded decision; see [Service mesh (Istio): not used, by decision](#service-mesh-istio-not-used-by-decision).
@@ -289,7 +291,7 @@ Each component's policies live in its `base/` (shared by both sites), with per-s
 
 | Workload | Allowed inbound | Allowed outbound |
 |---|---|---|
-| WordPress | From the ingress (ingress-nginx at home; the ALB on AWS), Prometheus | Database (MariaDB in-cluster / RDS Proxy endpoint), Valkey / ElastiCache, and by DNS name only: `*.s3.<region>.amazonaws.com`, `sqs.<region>.amazonaws.com`, `email-smtp.<region>.amazonaws.com`, `sts.<region>.amazonaws.com` |
+| WordPress | From the ingress (ingress-nginx at home; the ALB on AWS), Prometheus | Database (MariaDB in-cluster / RDS Proxy endpoint), Valkey / ElastiCache, and by DNS name only: `*.s3.<region>.amazonaws.com`, `sqs.<region>.amazonaws.com`, `email-smtp.<region>.amazonaws.com`, `sts.<region>.amazonaws.com`, and Google's login endpoints (`accounts.google.com`, `oauth2.googleapis.com`, `www.googleapis.com`) |
 | Summarizer | Prometheus | WordPress REST API (layer 7: `GET`/`POST` on `/wp-json/*` only), the LiteLLM gateway, `sqs.<region>.amazonaws.com` |
 | LiteLLM gateway | Summarizer, staging summarizer, ARC runners (evaluation), Prometheus | llama.cpp, `bedrock-runtime.<region>.amazonaws.com` |
 | llama.cpp (LLM nodes) | LiteLLM gateway, Prometheus | The model mirror bucket's S3 endpoint only (init container); nothing else |
@@ -475,6 +477,39 @@ IAM authentication doesn't exist for a self-hosted MariaDB, so the home lab remo
 The WordPress Rollout, Service, HPA and the rest of the base are the same for both sites; only where the credential comes from differs, which is exactly what overlays are for. A `wp-image` release adding the drop-in goes through ci → staging → prod like any other.
 
 **Interview angle:** in the cloud, the database trusts **IAM identities**, so the application has no secret at all; self-hosted, you can't remove every secret, so you **minimise, generate, isolate and rotate** them.
+
+## Admin sign-in with Google
+
+Admins and editors sign in to WordPress with their **Google accounts**, using **OpenID Connect (OIDC)**; there are no WordPress passwords for people. Site visitors don't log in. The admin area is also protected **at the edge**, so attackers can't even reach the login page. The reasoning is recorded in `docs/adr/0008-google-sign-in-for-admins.md`.
+
+### How it works
+
+| Piece | russetleaf.dev (home) | russetleaf.com (AWS) |
+|---|---|---|
+| **Edge layer** (in front of `/wp-admin/*` and `/wp-login.php`) | **Cloudflare Access**, with **Google** as its login provider (already used for Grafana, Argo CD and Hubble UI) | The **ALB's built-in OIDC authentication** rule with Google, on those paths only (a separate Ingress in the same ALB group) |
+| **WordPress login** | An **OIDC client plugin** built into the image, with Google as the provider | Same plugin and image |
+| **Google OAuth client** | Its own client, redirect URLs for russetleaf.dev and staging.russetleaf.dev | Its own client, redirect URL for russetleaf.com |
+| **Client secret** | Secrets Manager → External Secrets | Secrets Manager → External Secrets |
+
+An admin signs in once with Google at the edge, then once more (one click, no password) in WordPress.
+
+**Google Cloud setup (free):** one Google Cloud project with an OAuth consent screen using only the basic scopes (`openid`, `email`, `profile`), and an OAuth client per site (and one for local testing). With only basic scopes, Google's app review isn't usually required; until the app is published, only listed test users can sign in (check Google's current rules). OAuth clients for web apps are created in the Google Cloud console and documented in `wp-infra`'s README, since they can't be fully managed with Terraform; their secrets are stored in Secrets Manager.
+
+**The plugin:** a generic OIDC client plugin (e.g. "OpenID Connect Generic Client"; check current maintenance before choosing), pinned in `plugins.json` and configured entirely from **environment variables and constants** (client ID, client secret, endpoints, allowed emails), never from the admin screen.
+
+### Rules
+- **Allow-list:** only listed email addresses (or one Google Workspace domain) get a WordPress account; anyone else is refused, even with a valid Google login.
+- **No password logins for people:** password login on `/wp-login.php` is turned off for all user accounts.
+- **Application passwords stay enabled for the REST API**, because the post-summarizer (and staging's smoke tests) log in that way. Whatever turns off password logins must not block application passwords.
+- **Break-glass access:** if Google sign-in is unavailable, an admin is recovered with `wp-cli` inside the cluster (e.g. a one-off Job or `kubectl exec`), never by re-enabling password logins.
+
+### Supporting changes
+- **CiliumNetworkPolicy:** WordPress may reach Google's login endpoints by DNS name (`accounts.google.com`, `oauth2.googleapis.com`, `www.googleapis.com`).
+- **CloudFront (russetleaf.com):** `/wp-login.php`, `/wp-admin/*` and the OIDC callback path go to the origin **uncached**, with cookies and query strings forwarded.
+- **ci tests:** a **mock OIDC provider** (e.g. Dex or a mock OAuth2 server) in the kind cluster, so sign-in is tested without real Google accounts.
+
+### Cost
+**$0.** Google's OAuth for basic sign-in is free, the plugin is open source, Cloudflare Access is free for up to 50 users, and the ALB's OIDC rule adds no charge. **No AWS components are required**; Secrets Manager (already in use) holds the client secrets. Amazon Cognito isn't needed.
 
 ## AI post summaries
 
@@ -1058,6 +1093,7 @@ Together with the home lab, the total stays within **$30–$50/month**. If the A
 - **LLM monitoring:** token, latency, error, fallback and cost metrics per model and prompt version, plus model-server throughput, in Prometheus and Grafana, with alerts.
 - **Progressive delivery:** Argo Rollouts canaries with automatic rollback based on Prometheus metrics, plus gateway canaries for model changes.
 - **Architecture decision records:** documented choices with their trade-offs, e.g. why media is on S3 rather than the commonly recommended EFS, and why there's no service mesh and when one would be added, with an optional Istio ambient experiment to back it up.
+- **Passwordless admin access:** Google sign-in (OIDC) for WordPress, an edge login layer (Cloudflare Access at home, ALB OIDC on AWS), application passwords kept only for the REST API, and break-glass recovery with `wp-cli`.
 - **Zero-trust networking with Cilium on both clusters:** WireGuard encryption between nodes, default-deny CiliumNetworkPolicies, outbound traffic allowed by DNS name, layer-7 rules where useful, and Hubble flow visibility with metrics, dashboards and alerts in the same Prometheus and Grafana.
 - **Supply-chain security and policy as code:** SBOMs attached as signed attestations, vulnerability scans and signed images in CI, signature checks on upstream images too, with the same Kyverno policies tested in CI and enforced in the cluster (signatures, tags, resource limits), plus Checkov scanning Terraform, rendered manifests, Helm charts, Dockerfiles and GitHub Actions workflows in all four repos, with results in GitHub code scanning.
 - **Runtime security and compliance:** Falco rules written for this application (shells in pods, writes to WordPress code, unexpected egress from LLM nodes), alerts in Grafana, CIS benchmark reports from kube-bench on EKS, continuous Trivy Operator compliance reports on both clusters, periodic Kubescape NSA-CISA, MITRE ATT&CK and RBAC reports, and monthly Prowler scans of the AWS account against CIS AWS Foundations.
@@ -1117,7 +1153,8 @@ wp-gitops/
     adr/                    # architecture decision records (e.g. 0001-no-service-mesh.md,
                             #   0002-s3-media-not-efs.md, 0003-kubescape-cli-not-operator.md,
                             #   0004-ghcr-not-ecr.md, 0005-loki-alloy-for-logs.md,
-                            #   0006-tempo-tracing.md, 0007-prowler-not-threatmapper.md)
+                            #   0006-tempo-tracing.md, 0007-prowler-not-threatmapper.md,
+                            #   0008-google-sign-in-for-admins.md)
                             # + diagrams, cost breakdown, Grafana screenshots, CIS/kube-bench reports,
                             #   Talos hardening notes, demo recordings
   bootstrap/
@@ -1234,7 +1271,8 @@ wp-image/
   Dockerfile                # based on the official wordpress image, plugins and themes added, OPcache on,
                             #   RDS CA bundle
   db.php                    # database drop-in: IAM auth token mode (database.auth: iam) or plain password
-  plugins.json              # pinned plugin and theme versions (offload media, Redis object cache, SMTP, ...)
+  plugins.json              # pinned plugin and theme versions (offload media, Redis object cache, SMTP,
+                            #   OIDC login, ...)
   chart/                    # the WordPress Helm chart: Rollout, Service, Ingress, HPA, PDB, WP-Cron CronJob,
                             #   CiliumNetworkPolicy (per-site destinations set in values), probes, non-root +
                             #   read-only root filesystem with emptyDir volumes for writable paths
